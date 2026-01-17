@@ -315,32 +315,42 @@ class Provider {
                         // Pattern 4: Extract embed URLs from scripts (most reliable for this site)
                         const urlMatches = embedHtml.match(/https?:\/\/[^"'\s<>]+(?:\.m3u8|\.mp4|\/embed\/[^"'\s<>]+|\/e\/[^"'\s<>]+)/gi)
                         if (urlMatches) {
-                            // Group URLs by language sections (typically: Sub, Latino, Castellano)
-                            // We detect language from URLs that have it, then apply to nearby URLs
-                            let currentLanguage = "Sub" // Default to Sub
+                            let currentLanguage = "Sub"
                             
-                            urlMatches.forEach((url, i) => {
+                            for (const url of urlMatches) {
                                 let cleanUrl = url.replace(/["'<>]/g, "").trim()
                                 
-                                if (!videoSources.find(s => s.url === cleanUrl)) {
-                                    let serverName = this.identifyServerFromUrl(cleanUrl)
-                                    let detectedLanguage = this.identifyLanguageFromUrl(cleanUrl)
-                                    
-                                    // Update current language if detected
-                                    if (detectedLanguage) {
-                                        currentLanguage = detectedLanguage
-                                    }
-                                    
-                                    let quality = `${serverName} - ${currentLanguage}`
-                                    
-                                    videoSources.push({
-                                        url: cleanUrl,
-                                        type: cleanUrl.includes(".m3u8") ? "m3u8" : cleanUrl.includes(".mp4") ? "mp4" : "unknown",
-                                        quality: quality,
-                                        subtitles: []
-                                    })
+                                let serverName = this.identifyServerFromUrl(cleanUrl)
+                                let detectedLanguage = this.identifyLanguageFromUrl(cleanUrl)
+                                
+                                if (detectedLanguage) {
+                                    currentLanguage = detectedLanguage
                                 }
-                            })
+                                
+                                let quality = `${serverName} - ${currentLanguage}`
+                                
+                                // Skip if we already have this server+language combo
+                                if (videoSources.find(s => s.quality === quality)) continue
+                                
+                                // Try to extract direct video URL from embed
+                                try {
+                                    console.log(`AnimeOnlineNinja: Extracting from ${serverName}: ${cleanUrl.substring(0, 60)}...`)
+                                    const directUrl = await this.extractDirectVideoUrl(cleanUrl, serverName)
+                                    if (directUrl) {
+                                        console.log(`AnimeOnlineNinja: Got direct URL for ${serverName}`)
+                                        videoSources.push({
+                                            url: directUrl,
+                                            type: directUrl.includes(".m3u8") ? "m3u8" : directUrl.includes(".mp4") ? "mp4" : "unknown",
+                                            quality: quality,
+                                            subtitles: []
+                                        })
+                                    } else {
+                                        console.log(`AnimeOnlineNinja: No direct URL for ${serverName}, using embed`)
+                                    }
+                                } catch (e) {
+                                    console.log(`AnimeOnlineNinja: Error extracting from ${serverName}: ${e}`)
+                                }
+                            }
                         }
                     }
                 } catch (e) {
@@ -376,16 +386,256 @@ class Provider {
                 })
             }
 
-            console.log(`AnimeOnlineNinja: Found ${videoSources.length} video sources`)
+            // Filter out invalid entries but keep valid sources
+            const uniqueSources: VideoSource[] = []
+            const seenQuality = new Set<string>()
+            
+            for (const source of videoSources) {
+                // Skip if URL is invalid
+                if (!source.url || !source.url.startsWith("http")) continue
+                
+                // Skip embed URLs (we only want direct video URLs)
+                if (source.url.includes("/e/") || source.url.includes("/embed/")) continue
+                
+                // Skip if we already have this quality (server + language combo)
+                if (seenQuality.has(source.quality)) continue
+                
+                seenQuality.add(source.quality)
+                uniqueSources.push(source)
+            }
+
+            console.log(`AnimeOnlineNinja: Found ${uniqueSources.length} video sources`)
             return {
                 server: server === "default" ? "animeonline" : server,
                 headers: this.headers,
-                videoSources: videoSources
+                videoSources: uniqueSources
             }
         } catch (error) {
             console.error("AnimeOnlineNinja: Error:", error)
             return { server: server, headers: this.headers, videoSources: [] }
         }
+    }
+
+    private async extractDirectVideoUrl(embedUrl: string, serverName: string): Promise<string | null> {
+        try {
+            const res = await fetch(embedUrl, {
+                headers: {
+                    "User-Agent": this.headers["User-Agent"],
+                    "Referer": this.baseUrl
+                }
+            })
+            
+            if (!res.ok) {
+                console.log(`AnimeOnlineNinja: ${serverName} returned ${res.status}`)
+                return null
+            }
+            
+            const html = res.text()
+            const serverLower = serverName.toLowerCase()
+            
+            // Streamtape extractor
+            if (serverLower.includes("streamtape")) {
+                // Pattern 1: Find the innerHTML assignment with the video URL
+                // Format: document.getElementById('robotlink').innerHTML = '//streamtape.com/get_video?id=xxx&...' + 'token_part'
+                const robotMatch = html.match(/getElementById\(['"](?:robot|norobot)link['"]\)\.innerHTML\s*=\s*['"]([^'"]+)['"]\s*\+\s*\(?['"]([^'"]+)['"]/)
+                if (robotMatch) {
+                    let url = robotMatch[1] + robotMatch[2]
+                    // Clean up the URL
+                    url = url.replace(/&amp;/g, "&")
+                    if (url.startsWith("//")) url = "https:" + url
+                    // Validate it's a proper streamtape URL
+                    if (url.includes("streamtape.com/get_video")) {
+                        return url
+                    }
+                }
+                
+                // Pattern 2: Look for the full get_video URL in the page
+                const getVideoMatch = html.match(/['"]?(https?:)?\/\/streamtape\.com\/get_video\?[^"'\s<>]+['"]?/)
+                if (getVideoMatch) {
+                    let url = getVideoMatch[0].replace(/['"]/g, "")
+                    if (url.startsWith("//")) url = "https:" + url
+                    return url
+                }
+            }
+            
+            // Filemoon extractor
+            if (serverLower.includes("filemoon") || serverLower.includes("filemooon")) {
+                // Look for packed/eval script - this is the most common pattern
+                const evalMatch = html.match(/eval\(function\(p,a,c,k,e,d\)[\s\S]*?\('([^']+)',(\d+),(\d+),'([^']+)'\.split\('\|'\)/)
+                if (evalMatch) {
+                    try {
+                        const unpacked = this.unpackPACKER(evalMatch[1], parseInt(evalMatch[2]), parseInt(evalMatch[3]), evalMatch[4].split('|'))
+                        const m3u8Match = unpacked.match(/file\s*:\s*["']([^"']+\.m3u8[^"']*)["']/)
+                            || unpacked.match(/sources\s*:\s*\[\s*\{\s*file\s*:\s*["']([^"']+)["']/)
+                        if (m3u8Match) return m3u8Match[1]
+                    } catch (e) {
+                        console.log(`AnimeOnlineNinja: Filemoon unpack error: ${e}`)
+                    }
+                }
+                // Direct search in HTML
+                const directMatch = html.match(/file\s*:\s*["'](https?:\/\/[^"']+\.m3u8[^"']*)["']/)
+                    || html.match(/sources\s*:\s*\[\s*\{\s*file\s*:\s*["'](https?:\/\/[^"']+)["']/)
+                if (directMatch) return directMatch[1]
+            }
+            
+            // Voe extractor
+            if (serverLower.includes("voe")) {
+                // Voe often redirects, check if we got a redirect page
+                if (html.includes("redirect") || html.length < 1000) {
+                    // Try to find redirect URL
+                    const redirectMatch = html.match(/window\.location\.href\s*=\s*["']([^"']+)["']/)
+                        || html.match(/http-equiv=["']refresh["'][^>]*url=([^"'\s>]+)/)
+                    if (redirectMatch) {
+                        const redirectRes = await fetch(redirectMatch[1], {
+                            headers: { "User-Agent": this.headers["User-Agent"], "Referer": embedUrl }
+                        })
+                        if (redirectRes.ok) {
+                            const redirectHtml = redirectRes.text()
+                            // Continue with redirected content
+                            const hlsMatch = redirectHtml.match(/'hls'\s*:\s*'([^']+)'/) || redirectHtml.match(/"hls"\s*:\s*"([^"]+)"/)
+                            if (hlsMatch) return hlsMatch[1]
+                        }
+                    }
+                }
+                
+                // Pattern 1: HLS in JSON object
+                const hlsMatch = html.match(/'hls'\s*:\s*'([^']+)'/)
+                    || html.match(/"hls"\s*:\s*"([^"]+)"/)
+                    || html.match(/hls["']\s*:\s*["']([^"']+)["']/)
+                if (hlsMatch) return hlsMatch[1]
+                
+                // Pattern 2: MP4 source
+                const mp4Match = html.match(/'mp4'\s*:\s*'([^']+)'/)
+                    || html.match(/"mp4"\s*:\s*"([^"]+)"/)
+                if (mp4Match) return mp4Match[1]
+                
+                // Pattern 3: Direct m3u8/mp4 URL in page
+                const directMatch = html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/)
+                    || html.match(/(https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*)/)
+                if (directMatch) return directMatch[1]
+            }
+            
+            // Doodstream extractor
+            if (serverLower.includes("dood")) {
+                // Find the pass_md5 URL
+                const passMatch = html.match(/\$\.get\(['"]([^'"]*\/pass_md5\/[^'"]+)['"]/)
+                    || html.match(/\/pass_md5\/([^'"]+)['"]/)
+                if (passMatch) {
+                    let passUrl = passMatch[1]
+                    if (!passUrl.startsWith("http")) {
+                        const baseMatch = embedUrl.match(/(https?:\/\/[^\/]+)/)
+                        if (baseMatch) passUrl = baseMatch[1] + passUrl
+                    }
+                    
+                    const passRes = await fetch(passUrl, {
+                        headers: {
+                            "User-Agent": this.headers["User-Agent"],
+                            "Referer": embedUrl
+                        }
+                    })
+                    if (passRes.ok) {
+                        const passData = passRes.text()
+                        const token = this.generateRandomString(10)
+                        return passData + token + "?token=" + passUrl.split('/').pop() + "&expiry=" + Date.now()
+                    }
+                }
+            }
+            
+            // Netu/HQQ extractor
+            if (serverLower.includes("netu") || serverLower.includes("netuplayer")) {
+                // Pattern 1: Direct m3u8 in sources
+                const m3u8Match = html.match(/file\s*:\s*["']([^"']+\.m3u8[^"']*)["']/)
+                    || html.match(/src\s*:\s*["']([^"']+\.m3u8[^"']*)["']/)
+                if (m3u8Match) return m3u8Match[1]
+                
+                // Pattern 2: Encoded in atob
+                const atobMatch = html.match(/atob\(["']([^"']+)["']\)/)
+                if (atobMatch) {
+                    try {
+                        const decoded = CryptoJS.enc.Base64.parse(atobMatch[1])
+                        const url = CryptoJS.enc.Utf8.stringify(decoded)
+                        if (url.includes(".m3u8") || url.includes(".mp4")) return url
+                    } catch {}
+                }
+                
+                // Pattern 3: player.src
+                const srcMatch = html.match(/player\.src\s*\(\s*\{\s*src\s*:\s*["']([^"']+)["']/)
+                if (srcMatch) return srcMatch[1]
+            }
+            
+            // Uqload extractor
+            if (serverLower.includes("uqload")) {
+                const sourceMatch = html.match(/sources\s*:\s*\[\s*["']([^"']+)["']\s*\]/)
+                    || html.match(/file\s*:\s*["']([^"']+\.mp4[^"']*)["']/)
+                    || html.match(/src\s*:\s*["']([^"']+\.mp4[^"']*)["']/)
+                if (sourceMatch) return sourceMatch[1]
+            }
+            
+            // Generic extractor - try common patterns
+            const genericPatterns = [
+                /file\s*:\s*["']([^"']+\.m3u8[^"']*)["']/,
+                /source\s*:\s*["']([^"']+\.m3u8[^"']*)["']/,
+                /src\s*:\s*["']([^"']+\.m3u8[^"']*)["']/,
+                /file\s*:\s*["']([^"']+\.mp4[^"']*)["']/,
+                /source\s*:\s*["']([^"']+\.mp4[^"']*)["']/,
+                /sources\s*:\s*\[\s*\{\s*[^}]*file\s*:\s*["']([^"']+)["']/,
+                /https?:\/\/[^"'\s<>]+\.m3u8[^"'\s<>]*/,
+                /https?:\/\/[^"'\s<>]+\.mp4[^"'\s<>]*/
+            ]
+            
+            for (const pattern of genericPatterns) {
+                const match = html.match(pattern)
+                if (match) {
+                    const url = match[1] || match[0]
+                    if (url && (url.includes(".m3u8") || url.includes(".mp4"))) {
+                        return url
+                    }
+                }
+            }
+            
+            return null
+        } catch (e) {
+            console.error(`AnimeOnlineNinja: Error extracting from ${serverName}: ${e}`)
+            return null
+        }
+    }
+
+    private unpackScript(packed: string): string {
+        try {
+            const match = packed.match(/}\('(.+)',(\d+),(\d+),'([^']+)'\.split\('\|'\)/)
+            if (!match) return packed
+            return this.unpackPACKER(match[1], parseInt(match[2]), parseInt(match[3]), match[4].split("|"))
+        } catch {
+            return packed
+        }
+    }
+
+    private unpackPACKER(payload: string, radix: number, count: number, keywords: string[]): string {
+        const decode = (c: number): string => {
+            const chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            if (c < radix) {
+                return c < 36 ? c.toString(36) : chars[c]
+            }
+            return decode(Math.floor(c / radix)) + (c % radix < 36 ? (c % radix).toString(36) : chars[c % radix])
+        }
+
+        let unpacked = payload
+        for (let i = count - 1; i >= 0; i--) {
+            if (keywords[i]) {
+                const pattern = new RegExp("\\b" + decode(i) + "\\b", "g")
+                unpacked = unpacked.replace(pattern, keywords[i])
+            }
+        }
+        return unpacked
+    }
+
+    private generateRandomString(length: number): string {
+        const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        let result = ""
+        for (let i = 0; i < length; i++) {
+            result += chars.charAt(Math.floor(Math.random() * chars.length))
+        }
+        return result
     }
 
     private identifyServerFromUrl(url: string): string {
