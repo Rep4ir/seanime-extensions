@@ -1,0 +1,45 @@
+{
+    "id": "animeonline-ninja",
+    "name": "AnimeOnline Ninja",
+    "description": "Spanish anime streaming provider with Sub, Latino, and Castellano audio options",
+    "manifestURI": "",
+    "version": "1.0.0",
+    "author": "Rep4ir",
+    "type": "onlinestream-provider",
+    "language": "typescript",
+    "lang": "es",
+    "icon": "veranimeninja/favicon.png",
+    "payloadURI": "",
+    "userConfig": {
+        "requiresConfig": false,
+        "version": 1,
+        "fields": [
+            {
+                "name": "preferredAudio",
+                "label": "Preferred Audio",
+                "type": "select",
+                "default": "sub",
+                "options": [
+                    { "label": "Subtitulado (Sub)", "value": "sub" },
+                    { "label": "Latino", "value": "lat" },
+                    { "label": "Castellano", "value": "esp" }
+                ]
+            },
+            {
+                "name": "preferredServer",
+                "label": "Preferred Server",
+                "type": "select",
+                "default": "default",
+                "options": [
+                    { "label": "Auto (First Available)", "value": "default" },
+                    { "label": "Filemoon", "value": "filemoon" },
+                    { "label": "StreamWish", "value": "streamwish" },
+                    { "label": "Voe", "value": "voe" },
+                    { "label": "DoodStream", "value": "doodstream" },
+                    { "label": "Mp4Upload", "value": "mp4upload" },
+                    { "label": "YourUpload", "value": "yourupload" }
+                ]
+            }
+        ]
+    }
+}
