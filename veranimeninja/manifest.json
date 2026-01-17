@@ -3,7 +3,7 @@
     "name": "Anime Online Ninja",
     "description": "Spanish anime streaming provider with Sub, Latino, and Castellano audio options",
     "manifestURI": "https://raw.githubusercontent.com/Rep4ir/seanime-extensions/refs/heads/main/veranimeninja/manifest.json",
-    "version": "1.0.2",
+    "version": "1.0.3",
     "author": "Rep4ir",
     "type": "onlinestream-provider",
     "language": "typescript",

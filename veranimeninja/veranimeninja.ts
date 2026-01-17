@@ -405,9 +405,32 @@ class Provider {
             }
 
             console.log(`AnimeOnlineNinja: Found ${uniqueSources.length} video sources`)
+            
+            // Determine the best referer based on the video sources
+            // Most sources from this site come from Netu which needs netuplayer referer
+            let referer = "https://netuplayer.top/"
+            if (uniqueSources.length > 0) {
+                const firstUrl = uniqueSources[0].url.toLowerCase()
+                if (firstUrl.includes("streamtape")) {
+                    referer = "https://streamtape.com/"
+                } else if (firstUrl.includes("filemoon") || firstUrl.includes("filemooon")) {
+                    referer = "https://filemoon.sx/"
+                } else if (firstUrl.includes("dood")) {
+                    referer = "https://dood.wf/"
+                } else if (firstUrl.includes("voe")) {
+                    referer = "https://voe.sx/"
+                }
+            }
+            
+            const videoHeaders: { [key: string]: string } = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": referer,
+                "Origin": referer.replace(/\/$/, "")
+            }
+            
             return {
                 server: server === "default" ? "animeonline" : server,
-                headers: this.headers,
+                headers: videoHeaders,
                 videoSources: uniqueSources
             }
         } catch (error) {
