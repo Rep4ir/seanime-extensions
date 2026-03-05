@@ -1,0 +1,14 @@
+{
+    "id": "jkanime-provider",
+    "name": "JKAnime",
+    "description": "Stream anime from jkanime.net (Spanish subtitles)",
+    "manifestURI": "",
+    "version": "1.0.0",
+    "author": "",
+    "type": "onlinestream-provider",
+    "language": "typescript",
+    "lang": "es",
+    "readme": "",
+    "notes": "Provides sub-only Spanish content from jkanime.net. Uses CSRF token + session cookie for AJAX endpoints.",
+    "payloadURI": ""
+}

@@ -1,144 +1,349 @@
-/// <reference path="../../core.d.ts" />
 /// <reference path="../../online-streaming-provider.d.ts" />
 
+/**
+ * JKAnime - Online Streaming Provider for jkanime.net
+ *
+ * Flow:
+ *  1. search()         → GET /buscar/{query} (HTML scrape) or POST /ajax_search with CSRF
+ *  2. findEpisodes()   → POST /ajax/episodes/{animeId}/{page} with CSRF (paginated)
+ *  3. findEpisodeServer() → scrape episode page for jkplayer iframe URLs, then fetch
+ *                          the player page to extract the .m3u8 stream URL
+ *
+ * CSRF handling: jkanime.net requires a valid CSRF token + session cookie for its
+ * AJAX endpoints. We fetch the homepage first to obtain both, then reuse them.
+ */
 
 class Provider {
 
-    api = "https://jkanime.net/"
+    baseUrl = "https://jkanime.net"
 
     getSettings(): Settings {
         return {
-            episodeServers: ["desu", "magi", "desuka", "mega", "streamwish", "VOE", "vidhide", "mixdrop", "mp4upload", "streamtape", "doodstream", "fembed", "okru"],
+            // "Desu" and "Magi" are the two built-in servers on jkanime.net.
+            // "Desu" uses jkplayer/um, "Magi" uses jkplayer/umv — both serve m3u8.
+            episodeServers: ["Desu", "Magi"],
             supportsDub: false,
         }
     }
 
-    async search(query: SearchOptions): Promise<SearchResult[]> {
-        const res = await fetch(`${this.api}/buscar/`, {
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Fetches the homepage and returns { csrfToken, cookieHeader } so subsequent
+     * AJAX calls can authenticate properly.
+     *
+     * The engine exposes res.cookies as Record<string, string> and res.headers as
+     * Record<string, string> — neither supports .get(). We build the cookie header
+     * from res.cookies directly.
+     */
+    async _getSession(): Promise<{ csrfToken: string; cookieHeader: string }> {
+        const res = await fetch(this.baseUrl, {
+            headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
+        })
+
+        const html = res.text()
+
+        // Extract CSRF meta tag
+        const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/)
+        const csrfToken = csrfMatch ? csrfMatch[1] : ""
+
+        // Build cookie header from the engine's parsed cookies map
+        const cookies = res.cookies || {}
+        const cookieHeader = Object.keys(cookies)
+            .map((k) => `${k}=${cookies[k]}`)
+            .join("; ")
+
+        return { csrfToken, cookieHeader }
+    }
+
+    /**
+     * Normalises a title for fuzzy matching against jkanime slugs/titles.
+     * Strips punctuation, lowercases, collapses whitespace.
+     */
+    _normalise(s: string): string {
+        return s
+            .toLowerCase()
+            .replace(/[^a-z0-9\s]/g, " ")
+            .replace(/\s+/g, " ")
+            .trim()
+    }
+
+    /**
+     * Simple similarity score: fraction of query words present in the candidate.
+     */
+    _similarity(query: string, candidate: string): number {
+        const qWords = this._normalise(query).split(" ")
+        const cNorm = this._normalise(candidate)
+        const matches = qWords.filter((w) => cNorm.includes(w)).length
+        return matches / qWords.length
+    }
+
+    // ---------------------------------------------------------------------------
+    // search
+    // ---------------------------------------------------------------------------
+
+    async search(opts: SearchOptions): Promise<SearchResult[]> {
+        const { csrfToken, cookieHeader } = await this._getSession()
+
+        const res = await fetch(`${this.baseUrl}/ajax_search`, {
             method: "POST",
             headers: {
-                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "Content-Type": "application/x-www-form-urlencoded",
                 "X-Requested-With": "XMLHttpRequest",
+                "X-CSRF-TOKEN": csrfToken,
+                "Referer": this.baseUrl,
+                "Cookie": cookieHeader,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
-            body: `value=${encodeURIComponent(query.query.replace(/\s+/g, "+"))}`,
-        });
-
+            body: `q=${encodeURIComponent(opts.query)}`,
+        })
 
         if (!res.ok) {
-            return [];
+            return []
         }
 
-        const data = await res.json();
+        let data: any[]
+        try {
+            data = res.json()
+        } catch (_) {
+            return []
+        }
 
+        if (!Array.isArray(data)) {
+            return []
+        }
 
-        return data.map((anime: any) => ({
-            id: anime.slug,
-            title: anime.title,
-            url: `https://jkanime.net/${anime.slug}`,
-            subOrDub: "sub",
-        }));
+        const results: SearchResult[] = data.map((item: any) => ({
+            // id carries only the slug; findEpisodes scrapes the numeric jkanime
+            // ID from the anime page so we don't need to encode it here.
+            id: item.slug,
+            title: item.title,
+            url: `${this.baseUrl}/${item.slug}/`,
+            subOrDub: "sub" as SubOrDub,
+        }))
+
+        // Sort by similarity to the original query so the best match comes first.
+        // This helps when AniDB titles differ from jkanime titles (e.g. season suffixes).
+        results.sort((a, b) => this._similarity(opts.query, b.title) - this._similarity(opts.query, a.title))
+
+        return results
     }
+
+    // ---------------------------------------------------------------------------
+    // findEpisodes
+    // ---------------------------------------------------------------------------
 
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        const res = await fetch(`https://jkanime.net/${title}/${id}`);
-        const html = await res.text();
+        // id is the slug returned by search() (e.g. "naruto").
+        const slug = id
 
-        // Extrae el array de episodes del <script>
-        const match = html.match(/var episodes = (\[\[.*?\]\]);/);
-        if (!match) return [];
+        // Step 1: fetch the anime page to extract the numeric jkanime ID from
+        // the data-anime attribute (e.g. <div data-anime="20">).
+        const animePageRes = await fetch(`${this.baseUrl}/${slug}/`, {
+            headers: {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        })
 
-        const episodes = JSON.parse(match[1]) as [number, number][];
+        if (!animePageRes.ok) {
+            throw new Error(`Anime page not found for slug "${slug}" (status ${animePageRes.status})`)
+        }
 
-        const results = episodes.map(([episodeNum]) => ({
-            id: episodeNum.toString(),
-            number: episodeNum,
-            url: `https://jkanime.net/${title}/${episodeNum}`,
-            title: `Episode ${episodeNum}`,
-        }));
+        const animeHtml = animePageRes.text()
 
-        return results;
+        const animeIdMatch = animeHtml.match(/data-anime="(\d+)"/)
+        if (!animeIdMatch) {
+            throw new Error(`Could not find numeric anime ID on page for slug "${slug}"`)
+        }
+        const animeId = animeIdMatch[1]
+
+        // Step 2: get CSRF token + session cookie for the AJAX endpoints.
+        const { csrfToken, cookieHeader } = await this._getSession()
+
+        const commonHeaders = {
+            "X-Requested-With": "XMLHttpRequest",
+            "X-CSRF-TOKEN": csrfToken,
+            "Referer": `${this.baseUrl}/${slug}/`,
+            "Cookie": cookieHeader,
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        }
+
+        // Step 3: fetch first episode page to learn total pages.
+        const firstRes = await fetch(`${this.baseUrl}/ajax/episodes/${animeId}/1`, {
+            method: "POST",
+            headers: commonHeaders,
+            body: `_token=${encodeURIComponent(csrfToken)}`,
+        })
+
+        if (!firstRes.ok) {
+            throw new Error(`Failed to fetch episodes (status ${firstRes.status})`)
+        }
+
+        const firstData = firstRes.json() as {
+            data: Array<{ id: number; number: number; title: string }>
+            last_page: number
+        }
+
+        const episodes: EpisodeDetails[] = []
+
+        const pushPage = (items: Array<{ id: number; number: number; title: string }>) => {
+            for (const item of items) {
+                if (!Number.isInteger(item.number)) continue
+                episodes.push({
+                    // slug::episodeNumber so findEpisodeServer can build the URL
+                    id: `${slug}::${item.number}`,
+                    number: item.number,
+                    url: `${this.baseUrl}/${slug}/${item.number}/`,
+                    title: item.title || `Episodio ${item.number}`,
+                })
+            }
+        }
+
+        pushPage(firstData.data)
+
+        // Step 4: fetch remaining pages in parallel.
+        if (firstData.last_page > 1) {
+            const pageNums = Array.from({ length: firstData.last_page - 1 }, (_, i) => i + 2)
+            const pageResults = await Promise.all(
+                pageNums.map((p) =>
+                    fetch(`${this.baseUrl}/ajax/episodes/${animeId}/${p}`, {
+                        method: "POST",
+                        headers: commonHeaders,
+                        body: `_token=${encodeURIComponent(csrfToken)}`,
+                    }).then((r) => r.json()),
+                ),
+            ) as Array<{ data: Array<{ id: number; number: number; title: string }> }>
+
+            for (const page of pageResults) {
+                if (page && page.data) pushPage(page.data)
+            }
+        }
+
+        if (episodes.length === 0) {
+            throw new Error("No episodes found.")
+        }
+
+        episodes.sort((a, b) => a.number - b.number)
+
+        return episodes
     }
+
+    // ---------------------------------------------------------------------------
+    // findEpisodeServer
+    // ---------------------------------------------------------------------------
 
     async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
-        const res = await fetch(episode.url);
-        const html = await res.text();
+        // id format: "slug::episodeNumber"
+        const parts = episode.id.split("::")
+        const slug = parts[0]
+        const epNum = parts[1]
 
-        const match = html.match(/var videos = (\{.*?\});/);
-        if (!match) throw new Error("No se encontró el objeto 'videos' en el HTML.");
+        const episodeUrl = `${this.baseUrl}/${slug}/${epNum}/`
 
-        const videos = JSON.parse(match[1]) as Record<string, any[]>;
-        const servers: Record<string, { server: string; url: string }[]> = {};
-        const orderedTypes = Object.keys(videos).sort((a, b) => (a === "SUB" ? -1 : 1));
+        const res = await fetch(episodeUrl, {
+            headers: {
+                "Referer": `${this.baseUrl}/${slug}/`,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        })
 
-        for (const type of orderedTypes) {
-            servers[type] = videos[type].map(v => ({
-                server: v.server,
-                url: v.code || v.url,
-            }));
+        if (!res.ok) {
+            throw new Error(`Failed to fetch episode page (status ${res.status})`)
         }
 
-        const targetServer = "yu"
-        const selected = Object.values(servers)
-            .flat()
-            .find(s => s.server.toLowerCase() === targetServer);
+        const html = res.text()
 
-        if (!selected) throw new Error(`No se encontró el servidor ${_server}.`);
-
-        // Headers comunes
-        const headers = {
-            "Accept": "*/*",
-            "Accept-Encoding": "identity;q=1, *;q=0",
-            "Accept-Language": "es-ES,es;q=0.9",
-            "Connection": "keep-alive",
-            "Range": "bytes=0-",
-            "Referer": "https://www.yourupload.com/",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-        };
-
-        // YourUpload
-        const yuRes = await fetch(selected.url);
-        const yuHtml = await yuRes.text();
-
-
-        let videoMatch = yuHtml.match(/<video[^>]+src=["']([^"']+)["']/i);
-        let usedFallback = false;
-
-        if (!videoMatch) {
-            videoMatch = yuHtml.match(/file:\s*['"]([^'"]+\.mp4)['"]/i);
-            if (videoMatch) usedFallback = true;
+        // Extract all video[N] = '<iframe ... src="URL" ...' entries
+        // jkanime embeds them as: video[0] = '...'; video[1] = '...';
+        const videoRegex = /video\[(\d+)\]\s*=\s*'<iframe[^']*src="([^"]+)"[^']*>'/g
+        const iframes: Array<{ index: number; url: string }> = []
+        let m: RegExpExecArray | null
+        while ((m = videoRegex.exec(html)) !== null) {
+            iframes.push({ index: parseInt(m[1], 10), url: m[2] })
         }
 
-        if (!videoMatch || !videoMatch[1])
-            throw new Error("No se encontró la URL del video en YourUpload.");
-
-        const videoUrl = videoMatch[1];
-
-        if (usedFallback) {
-            return {
-                server: "yourupload",
-                headers,
-                videoSources: [{
-                    url: videoUrl,
-                    type: "mp4",
-                    quality: "unknown",
-                    subtitles: [],
-                }],
-            };
+        if (iframes.length === 0) {
+            throw new Error("No video sources found on episode page.")
         }
 
-        const finalReq = await fetch(videoUrl, { method: "GET", redirect: "manual", headers });
-        const finalUrl = finalReq.headers.get("location") || videoUrl;
+        // Also extract server button names to map index → server name
+        // <a id="btn-show-0" data-id="0" ... >Desu</a>
+        const serverNameRegex = /id="btn-show-(\d+)"[^>]*>([^<]+)<\/a>/g
+        const serverNames: Record<number, string> = {}
+        let sn: RegExpExecArray | null
+        while ((sn = serverNameRegex.exec(html)) !== null) {
+            serverNames[parseInt(sn[1], 10)] = sn[2].trim()
+        }
+
+        // Determine which iframe to use based on requested server name
+        let targetIframe = iframes[0]
+        const serverLower = _server.toLowerCase()
+
+        for (const iframe of iframes) {
+            const name = (serverNames[iframe.index] || "").toLowerCase()
+            if (name === serverLower) {
+                targetIframe = iframe
+                break
+            }
+        }
+
+        // Fetch the jkplayer page to extract the .m3u8 URL
+        const playerRes = await fetch(targetIframe.url, {
+            headers: {
+                "Referer": `${this.baseUrl}/`,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            },
+        })
+
+        if (!playerRes.ok) {
+            throw new Error(`Failed to fetch player page (status ${playerRes.status})`)
+        }
+
+        const playerHtml = playerRes.text()
+
+        // The player page embeds the stream URL in one of these patterns:
+        //   url: 'https://...m3u8?...'
+        //   <source src='https://...m3u8?...' type='application/x-mpegURL'>
+        //   hls.loadSource('https://...m3u8?...')
+        const m3u8Patterns = [
+            /url:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/,
+            /<source\s+src=['"]([^'"]+\.m3u8[^'"]*)['"]/,
+            /hls\.loadSource\(\s*['"]([^'"]+\.m3u8[^'"]*)['"]\s*\)/,
+            /['"]([^'"]+\.m3u8[^'"]*)['"]/,
+        ]
+
+        let streamUrl = ""
+        for (const pattern of m3u8Patterns) {
+            const match = playerHtml.match(pattern)
+            if (match && match[1]) {
+                streamUrl = match[1]
+                break
+            }
+        }
+
+        if (!streamUrl) {
+            throw new Error("Could not extract stream URL from player page.")
+        }
+
+        const serverName = serverNames[targetIframe.index] || `server-${targetIframe.index}`
 
         return {
-            server: "yourupload",
-            headers,
-            videoSources: [{
-                url: finalUrl,
-                type: "mp4",
-                quality: "unknown",
-                subtitles: [],
-            }],
-        };
+            server: serverName,
+            headers: {
+                "Referer": targetIframe.url,
+                "Origin": this.baseUrl,
+            },
+            videoSources: [
+                {
+                    url: streamUrl,
+                    type: "m3u8",
+                    quality: "default",
+                    subtitles: [],
+                },
+            ],
+        }
     }
-
 }
