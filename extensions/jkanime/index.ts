@@ -21,8 +21,8 @@ class Provider {
         return {
             // "Desu" and "Magi" are the two built-in servers on jkanime.net.
             // "Desu" uses jkplayer/um, "Magi" uses jkplayer/umv — both serve m3u8.
-            episodeServers: ["Desu", "Magi"],
-            supportsDub: false,
+            episodeServers: ["Desu", "Magi", "Mega", "Streamwish", "VOE", "Vidhide", "Filemoon", "Mixdrop", "Mp4upload", "Streamtape", "Doodstream"],
+            supportsDub: true,
         }
     }
 
@@ -43,7 +43,7 @@ class Provider {
             headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
         })
 
-        const html = res.text()
+        const html = await res.text()
 
         // Extract CSRF meta tag
         const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/)
