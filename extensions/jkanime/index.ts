@@ -7,10 +7,9 @@
  *  1. search()         → GET /buscar/{query} (HTML scrape) or POST /ajax_search with CSRF
  *  2. findEpisodes()   → POST /ajax/episodes/{animeId}/{page} with CSRF (paginated)
  *  3. findEpisodeServer() → scrape episode page for jkplayer iframe URLs, then fetch
- *                          the player page to extract the .m3u8 stream URL
- *
- * CSRF handling: jkanime.net requires a valid CSRF token + session cookie for its
- * AJAX endpoints. We fetch the homepage first to obtain both, then reuse them.
+ *                          the player page to extract the video stream URL.
+ *                          Now supports multiple servers: Mega, Streamwish, VOE, Vidhide,
+ *                          Filemoon, Mixdrop, Mp4upload, Streamtape, Doodstream, etc.
  */
 
 class Provider {
@@ -19,8 +18,6 @@ class Provider {
 
     getSettings(): Settings {
         return {
-            // "Desu" and "Magi" are the two built-in servers on jkanime.net.
-            // "Desu" uses jkplayer/um, "Magi" uses jkplayer/umv — both serve m3u8.
             episodeServers: ["Desu", "Magi", "Mega", "Streamwish", "VOE", "Vidhide", "Filemoon", "Mixdrop", "Mp4upload", "Streamtape", "Doodstream"],
             supportsDub: true,
         }
@@ -30,26 +27,15 @@ class Provider {
     // Helpers
     // ---------------------------------------------------------------------------
 
-    /**
-     * Fetches the homepage and returns { csrfToken, cookieHeader } so subsequent
-     * AJAX calls can authenticate properly.
-     *
-     * The engine exposes res.cookies as Record<string, string> and res.headers as
-     * Record<string, string> — neither supports .get(). We build the cookie header
-     * from res.cookies directly.
-     */
     async _getSession(): Promise<{ csrfToken: string; cookieHeader: string }> {
         const res = await fetch(this.baseUrl, {
             headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" },
         })
 
         const html = await res.text()
-
-        // Extract CSRF meta tag
         const csrfMatch = html.match(/<meta name="csrf-token" content="([^"]+)"/)
         const csrfToken = csrfMatch ? csrfMatch[1] : ""
 
-        // Build cookie header from the engine's parsed cookies map
         const cookies = res.cookies || {}
         const cookieHeader = Object.keys(cookies)
             .map((k) => `${k}=${cookies[k]}`)
@@ -58,10 +44,6 @@ class Provider {
         return { csrfToken, cookieHeader }
     }
 
-    /**
-     * Normalises a title for fuzzy matching against jkanime slugs/titles.
-     * Strips punctuation, lowercases, collapses whitespace.
-     */
     _normalise(s: string): string {
         return s
             .toLowerCase()
@@ -70,14 +52,61 @@ class Provider {
             .trim()
     }
 
-    /**
-     * Simple similarity score: fraction of query words present in the candidate.
-     */
     _similarity(query: string, candidate: string): number {
         const qWords = this._normalise(query).split(" ")
         const cNorm = this._normalise(candidate)
         const matches = qWords.filter((w) => cNorm.includes(w)).length
         return matches / qWords.length
+    }
+
+    /**
+     * Extract video URL from an iframe page content using multiple patterns.
+     * Returns the first found URL, or empty string if none.
+     */
+    _extractStreamFromPage(html: string, iframeUrl: string): string {
+        // Direct video file? (iframe URL itself could be the video)
+        if (/\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(iframeUrl)) {
+            return iframeUrl
+        }
+
+        // Try to find a URL in common patterns
+        const patterns = [
+            // <source> tags
+            /<source\s+src=["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            // JavaScript assignments
+            /(?:file|src|video_url|source|url)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            // hls.loadSource
+            /hls\.loadSource\(\s*["']([^"']+\.m3u8[^"']*)["']\s*\)/i,
+            // Generic src attribute
+            /src=["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            // JSON-like config: "file":"..."
+            /["']file["']\s*:\s*["']([^"']+)["']/i,
+            /["']url["']\s*:\s*["']([^"']+)["']/i,
+            // Playlist or video tag
+            /video\s+src=["']([^"']+)["']/i,
+            // Any m3u8 or mp4 in the page (fallback)
+            /(https?:\/\/[^\s'"]+\.(?:m3u8|mp4)[^\s'"]*)/i,
+        ]
+
+        for (const pattern of patterns) {
+            const match = html.match(pattern)
+            if (match && match[1]) {
+                let url = match[1]
+                // If relative, resolve against iframe URL
+                if (url.startsWith("/")) {
+                    const base = new URL(iframeUrl)
+                    url = `${base.protocol}//${base.host}${url}`
+                } else if (!url.startsWith("http")) {
+                    // Try to resolve relative path
+                    try {
+                        url = new URL(url, iframeUrl).toString()
+                    } catch (_) { /* ignore */ }
+                }
+                return url
+            }
+        }
+
+        return ""
     }
 
     // ---------------------------------------------------------------------------
@@ -116,18 +145,13 @@ class Provider {
         }
 
         const results: SearchResult[] = data.map((item: any) => ({
-            // id carries only the slug; findEpisodes scrapes the numeric jkanime
-            // ID from the anime page so we don't need to encode it here.
             id: item.slug,
             title: item.title,
             url: `${this.baseUrl}/${item.slug}/`,
             subOrDub: "sub" as SubOrDub,
         }))
 
-        // Sort by similarity to the original query so the best match comes first.
-        // This helps when AniDB titles differ from jkanime titles (e.g. season suffixes).
         results.sort((a, b) => this._similarity(opts.query, b.title) - this._similarity(opts.query, a.title))
-
         return results
     }
 
@@ -136,11 +160,8 @@ class Provider {
     // ---------------------------------------------------------------------------
 
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        // id is the slug returned by search() (e.g. "naruto").
         const slug = id
 
-        // Step 1: fetch the anime page to extract the numeric jkanime ID from
-        // the data-anime attribute (e.g. <div data-anime="20">).
         const animePageRes = await fetch(`${this.baseUrl}/${slug}/`, {
             headers: {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -152,14 +173,12 @@ class Provider {
         }
 
         const animeHtml = animePageRes.text()
-
         const animeIdMatch = animeHtml.match(/data-anime="(\d+)"/)
         if (!animeIdMatch) {
             throw new Error(`Could not find numeric anime ID on page for slug "${slug}"`)
         }
         const animeId = animeIdMatch[1]
 
-        // Step 2: get CSRF token + session cookie for the AJAX endpoints.
         const { csrfToken, cookieHeader } = await this._getSession()
 
         const commonHeaders = {
@@ -171,7 +190,6 @@ class Provider {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         }
 
-        // Step 3: fetch first episode page to learn total pages.
         const firstRes = await fetch(`${this.baseUrl}/ajax/episodes/${animeId}/1`, {
             method: "POST",
             headers: commonHeaders,
@@ -193,7 +211,6 @@ class Provider {
             for (const item of items) {
                 if (!Number.isInteger(item.number)) continue
                 episodes.push({
-                    // slug::episodeNumber so findEpisodeServer can build the URL
                     id: `${slug}::${item.number}`,
                     number: item.number,
                     url: `${this.baseUrl}/${slug}/${item.number}/`,
@@ -204,7 +221,6 @@ class Provider {
 
         pushPage(firstData.data)
 
-        // Step 4: fetch remaining pages in parallel.
         if (firstData.last_page > 1) {
             const pageNums = Array.from({ length: firstData.last_page - 1 }, (_, i) => i + 2)
             const pageResults = await Promise.all(
@@ -227,7 +243,6 @@ class Provider {
         }
 
         episodes.sort((a, b) => a.number - b.number)
-
         return episodes
     }
 
@@ -236,13 +251,12 @@ class Provider {
     // ---------------------------------------------------------------------------
 
     async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
-        // id format: "slug::episodeNumber"
         const parts = episode.id.split("::")
         const slug = parts[0]
         const epNum = parts[1]
-
         const episodeUrl = `${this.baseUrl}/${slug}/${epNum}/`
 
+        // Fetch episode page to get iframe and server names
         const res = await fetch(episodeUrl, {
             headers: {
                 "Referer": `${this.baseUrl}/${slug}/`,
@@ -256,8 +270,7 @@ class Provider {
 
         const html = res.text()
 
-        // Extract all video[N] = '<iframe ... src="URL" ...' entries
-        // jkanime embeds them as: video[0] = '...'; video[1] = '...';
+        // Extract iframes: video[0] = '<iframe src="..." ...'
         const videoRegex = /video\[(\d+)\]\s*=\s*'<iframe[^']*src="([^"]+)"[^']*>'/g
         const iframes: Array<{ index: number; url: string }> = []
         let m: RegExpExecArray | null
@@ -269,8 +282,7 @@ class Provider {
             throw new Error("No video sources found on episode page.")
         }
 
-        // Also extract server button names to map index → server name
-        // <a id="btn-show-0" data-id="0" ... >Desu</a>
+        // Extract server button names
         const serverNameRegex = /id="btn-show-(\d+)"[^>]*>([^<]+)<\/a>/g
         const serverNames: Record<number, string> = {}
         let sn: RegExpExecArray | null
@@ -278,10 +290,9 @@ class Provider {
             serverNames[parseInt(sn[1], 10)] = sn[2].trim()
         }
 
-        // Determine which iframe to use based on requested server name
+        // Find target iframe for the requested server (case-insensitive)
         let targetIframe = iframes[0]
         const serverLower = _server.toLowerCase()
-
         for (const iframe of iframes) {
             const name = (serverNames[iframe.index] || "").toLowerCase()
             if (name === serverLower) {
@@ -290,56 +301,78 @@ class Provider {
             }
         }
 
-        // Fetch the jkplayer page to extract the .m3u8 URL
-        const playerRes = await fetch(targetIframe.url, {
+        const iframeUrl = targetIframe.url
+        const serverName = serverNames[targetIframe.index] || `server-${targetIframe.index}`
+
+        // Fetch the iframe page (the player)
+        const playerRes = await fetch(iframeUrl, {
             headers: {
-                "Referer": `${this.baseUrl}/`,
+                "Referer": episodeUrl,  // The iframe is embedded in the episode page
+                "Origin": this.baseUrl,
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             },
+            // Some servers might require following redirects (fetch does by default)
         })
 
         if (!playerRes.ok) {
             throw new Error(`Failed to fetch player page (status ${playerRes.status})`)
         }
 
+        // Check if response is a video file (content-type) or direct URL
+        const contentType = playerRes.headers["content-type"] || ""
+        if (contentType.startsWith("video/") || /\.(m3u8|mp4|webm)(\?|$)/i.test(iframeUrl)) {
+            // The iframe URL itself is the video source
+            return {
+                server: serverName,
+                headers: {
+                    "Referer": episodeUrl,
+                    "Origin": this.baseUrl,
+                },
+                videoSources: [
+                    {
+                        url: iframeUrl,
+                        type: iframeUrl.includes(".m3u8") ? "m3u8" : "mp4",
+                        quality: "default",
+                        subtitles: [],
+                    },
+                ],
+            }
+        }
+
+        // Otherwise parse the HTML
         const playerHtml = playerRes.text()
 
-        // The player page embeds the stream URL in one of these patterns:
-        //   url: 'https://...m3u8?...'
-        //   <source src='https://...m3u8?...' type='application/x-mpegURL'>
-        //   hls.loadSource('https://...m3u8?...')
-        const m3u8Patterns = [
-            /url:\s*['"]([^'"]+\.m3u8[^'"]*)['"]/,
-            /<source\s+src=['"]([^'"]+\.m3u8[^'"]*)['"]/,
-            /hls\.loadSource\(\s*['"]([^'"]+\.m3u8[^'"]*)['"]\s*\)/,
-            /['"]([^'"]+\.m3u8[^'"]*)['"]/,
-        ]
+        // Extract stream URL using our helper
+        let streamUrl = this._extractStreamFromPage(playerHtml, iframeUrl)
 
-        let streamUrl = ""
-        for (const pattern of m3u8Patterns) {
-            const match = playerHtml.match(pattern)
-            if (match && match[1]) {
-                streamUrl = match[1]
-                break
+        // If still not found, try to look for any URL in the page that looks like a video
+        if (!streamUrl) {
+            // Fallback: search for any http(s) URL that contains m3u8, mp4, etc.
+            const fallbackPattern = /(https?:\/\/[^\s'"]+\.(?:m3u8|mp4|webm)[^\s'"]*)/i
+            const fallbackMatch = playerHtml.match(fallbackPattern)
+            if (fallbackMatch && fallbackMatch[1]) {
+                streamUrl = fallbackMatch[1]
             }
         }
 
         if (!streamUrl) {
-            throw new Error("Could not extract stream URL from player page.")
+            throw new Error(`Could not extract video stream URL from player page for server "${serverName}".`)
         }
 
-        const serverName = serverNames[targetIframe.index] || `server-${targetIframe.index}`
+        // Determine type
+        const isM3u8 = /\.m3u8/i.test(streamUrl)
+        const type: VideoSourceType = isM3u8 ? "m3u8" : "mp4" // assume mp4 if not m3u8
 
         return {
             server: serverName,
             headers: {
-                "Referer": targetIframe.url,
+                "Referer": iframeUrl,
                 "Origin": this.baseUrl,
             },
             videoSources: [
                 {
                     url: streamUrl,
-                    type: "m3u8",
+                    type: type,
                     quality: "default",
                     subtitles: [],
                 },
