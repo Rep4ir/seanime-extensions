@@ -17,10 +17,12 @@ class Provider {
     baseUrl = "https://jkanime.net"
 
     getSettings(): Settings {
-        return {
+        const settings = {
             episodeServers: ["Desu", "Magi", "Mega", "Streamwish", "VOE", "Vidhide", "Filemoon", "Mixdrop", "Mp4upload", "Streamtape", "Doodstream"],
             supportsDub: true,
-        }
+        };
+        console.log("getSettings called, returning:", settings);
+        return settings;
     }
 
     // ---------------------------------------------------------------------------
@@ -379,4 +381,9 @@ class Provider {
             ],
         }
     }
+}
+
+// Al final del archivo, después de la clase
+if (typeof window !== "undefined" && (window as any).registerProvider) {
+    (window as any).registerProvider(new Provider());
 }

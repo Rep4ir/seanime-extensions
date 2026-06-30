@@ -3,7 +3,7 @@
     "name": "JKAnime",
     "description": "Stream anime from jkanime.net (Spanish subtitles)",
     "manifestURI": "https://raw.githubusercontent.com/Rep4ir/anime/refs/heads/main/extensions/jkanime/manifest.json",
-    "version": "1.2.2",
+    "version": "1.3.0",
     "author": "Rep4ir",
     "type": "onlinestream-provider",
     "language": "typescript",
