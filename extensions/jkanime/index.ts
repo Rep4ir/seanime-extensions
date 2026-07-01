@@ -66,6 +66,21 @@ class Provider {
      * Returns the first found URL, or empty string if none.
      */
     _extractStreamFromPage(html: string, iframeUrl: string): string {
+
+        // Buscar en objetos JSON
+        const jsonMatch = html.match(/(?:file|video|source|url)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4)[^"']*)["']/i);
+        if (jsonMatch && jsonMatch[1]) return jsonMatch[1];
+
+        // Buscar en configuraciones de reproductores
+        const playerMatch = html.match(/player\.setup\s*\(\s*\{[^}]*file\s*:\s*["']([^"']+)["']/i);
+        if (playerMatch && playerMatch[1]) return playerMatch[1];
+
+        // Buscar en iframes anidados (a veces el video está en otro iframe)
+        const nestedIframe = html.match(/<iframe[^>]+src=["']([^"']+)["']/i);
+        if (nestedIframe && nestedIframe[1]) {
+            return nestedIframe[1];
+        }
+
         // Direct video file? (iframe URL itself could be the video)
         if (/\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(iframeUrl)) {
             return iframeUrl
@@ -253,6 +268,7 @@ class Provider {
     // ---------------------------------------------------------------------------
 
     async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
+        console.log("🔍 findEpisodeServer called for server:", _server);
         const parts = episode.id.split("::")
         const slug = parts[0]
         const epNum = parts[1]
@@ -360,6 +376,9 @@ class Provider {
         if (!streamUrl) {
             throw new Error(`Could not extract video stream URL from player page for server "${serverName}".`)
         }
+
+        console.log("📄 Player HTML length:", playerHtml.length);
+        console.log("🎬 Extracted stream URL:", streamUrl);
 
         // Determine type
         const isM3u8 = /\.m3u8/i.test(streamUrl)
