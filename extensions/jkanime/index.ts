@@ -8,8 +8,9 @@
  *  2. findEpisodes()   → POST /ajax/episodes/{animeId}/{page} with CSRF (paginated)
  *  3. findEpisodeServer() → 
  *      - Desu/Magi: lógica original (basada en video[N] y botones).
- *      - Otros servidores: extrae el array 'servers' del HTML, encuentra el 'remote'
- *        correspondiente al servidor, lo decodifica en base64 y usa esa URL.
+ *      - Otros servidores: extrae el array 'servers', encuentra el servidor,
+ *        decodifica el campo 'remote' (URL del embebido) y la devuelve
+ *        como fuente de video (tipo mp4) para que el reproductor intente cargarla.
  *      Servidores soportados: Desu, Magi, Streamwish, VOE, Vidhide, Filemoon, Mixdrop, Mp4upload.
  */
 
@@ -118,40 +119,6 @@ class Provider {
         }
 
         return "";
-    }
-
-    /**
-     * Detecta el tipo de contenido de una URL (mp4 o m3u8) haciendo una petición HEAD.
-     */
-    async _getContentType(url: string): Promise<'mp4' | 'm3u8' | 'unknown'> {
-        try {
-            const res = await fetch(url, {
-                method: 'HEAD',
-                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
-            });
-            const contentType = res.headers['content-type'] || '';
-            if (contentType.includes('video/mp4') || contentType.includes('video/webm')) {
-                return 'mp4';
-            }
-            if (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('audio/mpegurl')) {
-                return 'm3u8';
-            }
-            return 'unknown';
-        } catch (_) {
-            return 'unknown';
-        }
-    }
-
-    /**
-     * Determina el tipo de video (mp4 o m3u8) según la extensión o HEAD.
-     */
-    async _detectVideoType(url: string): Promise<'mp4' | 'm3u8'> {
-        if (/\.m3u8(\?.*)?$/i.test(url)) return 'm3u8';
-        if (/\.(mp4|webm|mkv)(\?.*)?$/i.test(url)) return 'mp4';
-        const detected = await this._getContentType(url);
-        if (detected === 'm3u8') return 'm3u8';
-        if (detected === 'mp4') return 'mp4';
-        return 'mp4'; // fallback
     }
 
     // ---------------------------------------------------------------------------
@@ -438,10 +405,9 @@ class Provider {
 
             let serversData: any[];
             try {
-                // Intentar parsear el JSON (puede contener comillas simples, etc.)
                 const jsonStr = serversMatch[1]
-                    .replace(/'/g, '"')           // Reemplazar comillas simples por dobles
-                    .replace(/([{,]\s*)(\w+):/g, '$1"$2":'); // Poner comillas a las claves
+                    .replace(/'/g, '"')
+                    .replace(/([{,]\s*)(\w+):/g, '$1"$2":');
                 serversData = JSON.parse(jsonStr);
             } catch (e) {
                 throw new Error(`Failed to parse servers array: ${e.message}`);
@@ -465,18 +431,17 @@ class Provider {
             const base64 = remoteBase64.replace(/-/g, '+').replace(/_/g, '/');
             const pad = base64.length % 4;
             const padded = pad ? base64 + '='.repeat(4 - pad) : base64;
-            let decodedUrl = '';
+            let embedUrl = '';
             if (typeof Buffer !== 'undefined') {
-                decodedUrl = Buffer.from(padded, 'base64').toString('utf-8');
+                embedUrl = Buffer.from(padded, 'base64').toString('utf-8');
             } else {
-                decodedUrl = atob(padded);
+                embedUrl = atob(padded);
             }
 
-            console.log(`🎬 Decoded remote URL for ${_server}: ${decodedUrl}`);
+            console.log(`🎬 Decoded remote URL for ${_server}: ${embedUrl}`);
 
-            // Detectar tipo de video
-            const type = await this._detectVideoType(decodedUrl);
-
+            // Devolver la URL del embebido como tipo 'mp4' para evitar error HLS
+            // (el reproductor intentará cargarla directamente, si es un iframe puede que no funcione)
             return {
                 server: _server,
                 headers: {
@@ -485,8 +450,8 @@ class Provider {
                 },
                 videoSources: [
                     {
-                        url: decodedUrl,
-                        type,
+                        url: embedUrl,
+                        type: 'mp4',
                         quality: "default",
                         subtitles: [],
                     },
