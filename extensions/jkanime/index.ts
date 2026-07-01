@@ -8,9 +8,8 @@
  *  2. findEpisodes()   → POST /ajax/episodes/{animeId}/{page} with CSRF (paginated)
  *  3. findEpisodeServer() → 
  *      - Desu/Magi: lógica original (basada en video[N] y botones).
- *      - Otros servidores: 
- *        - Si tiene 'u' → decodifica y sigue.
- *        - Si tiene 'e' → busca enlace de descarga directa en el HTML.
+ *      - Otros servidores: extrae el array 'servers' del HTML, encuentra el 'remote'
+ *        correspondiente al servidor, lo decodifica en base64 y usa esa URL.
  *      Servidores soportados: Desu, Magi, Streamwish, VOE, Vidhide, Filemoon, Mixdrop, Mp4upload.
  */
 
@@ -18,7 +17,7 @@ class Provider {
 
     baseUrl = "https://jkanime.net"
 
-    // Dominios característicos de cada servidor (solo para referencia, no se usan en la nueva lógica)
+    // Dominios característicos de cada servidor (solo para verificación)
     serverDomains: Record<string, string[]> = {
         "streamwish": ["streamwish.com", "sfastwish.com", "flaswish.com"],
         "voe": ["voe.sx", "jennifereconomicgive.com"],
@@ -75,7 +74,7 @@ class Provider {
 
     /**
      * Extract video URL from an iframe page content using multiple patterns.
-     * Usado para Desu/Magi y como fallback genérico.
+     * Usado para Desu/Magi.
      */
     _extractStreamFromPage(html: string, iframeUrl: string): string {
         if (/\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(iframeUrl)) {
@@ -119,6 +118,40 @@ class Provider {
         }
 
         return "";
+    }
+
+    /**
+     * Detecta el tipo de contenido de una URL (mp4 o m3u8) haciendo una petición HEAD.
+     */
+    async _getContentType(url: string): Promise<'mp4' | 'm3u8' | 'unknown'> {
+        try {
+            const res = await fetch(url, {
+                method: 'HEAD',
+                headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' },
+            });
+            const contentType = res.headers['content-type'] || '';
+            if (contentType.includes('video/mp4') || contentType.includes('video/webm')) {
+                return 'mp4';
+            }
+            if (contentType.includes('application/vnd.apple.mpegurl') || contentType.includes('audio/mpegurl')) {
+                return 'm3u8';
+            }
+            return 'unknown';
+        } catch (_) {
+            return 'unknown';
+        }
+    }
+
+    /**
+     * Determina el tipo de video (mp4 o m3u8) según la extensión o HEAD.
+     */
+    async _detectVideoType(url: string): Promise<'mp4' | 'm3u8'> {
+        if (/\.m3u8(\?.*)?$/i.test(url)) return 'm3u8';
+        if (/\.(mp4|webm|mkv)(\?.*)?$/i.test(url)) return 'mp4';
+        const detected = await this._getContentType(url);
+        if (detected === 'm3u8') return 'm3u8';
+        if (detected === 'mp4') return 'mp4';
+        return 'mp4'; // fallback
     }
 
     // ---------------------------------------------------------------------------
@@ -388,185 +421,77 @@ class Provider {
             }
 
             // -----------------------------------------------------------------
-            // Lógica para el resto de servidores (basada en player_conte)
+            // Lógica para el resto de servidores (Streamwish, VOE, etc.)
             // -----------------------------------------------------------------
 
             const serverLower = _server.toLowerCase();
-            // Verificar que el servidor está soportado (excluimos Mega, Streamtape, Doodstream, Desuka)
             if (!this.serverDomains[serverLower]) {
                 throw new Error(`Server "${_server}" is not supported. Supported: ${Object.keys(this.serverDomains).join(", ")}`);
             }
 
-            // Buscar el iframe con clase "player_conte"
-            const playerConteRegex = /<iframe[^>]+class=["']player_conte["'][^>]+src=["']([^"']+)["']/i;
-            const match = html.match(playerConteRegex);
-            if (!match || !match[1]) {
-                throw new Error("No player_conte iframe found on episode page.");
+            // Buscar el array 'servers' en el HTML
+            const serversRegex = /var\s+servers\s*=\s*(\[[\s\S]*?\]);/;
+            const serversMatch = html.match(serversRegex);
+            if (!serversMatch || !serversMatch[1]) {
+                throw new Error("Could not find servers array in HTML.");
             }
 
-            const iframeUrl = match[1];
-            console.log(`🎯 Found player_conte iframe: ${iframeUrl}`);
-
-            const urlObj = new URL(iframeUrl, this.baseUrl);
-            const uParam = urlObj.searchParams.get('u');
-            const eParam = urlObj.searchParams.get('e');
-
-            // -----------------------------------------------------------------
-            // Caso 1: Tiene 'u' → decodificar y seguir
-            // -----------------------------------------------------------------
-            if (uParam && uParam.length > 0) {
-                console.log(`🔑 Found 'u' parameter: ${uParam}`);
-                const base64 = uParam.replace(/-/g, '+').replace(/_/g, '/');
-                const pad = base64.length % 4;
-                const padded = pad ? base64 + '='.repeat(4 - pad) : base64;
-                let decoded = '';
-                if (typeof Buffer !== 'undefined') {
-                    decoded = Buffer.from(padded, 'base64').toString('utf-8');
-                } else {
-                    decoded = atob(padded);
-                }
-                console.log(`🎬 Decoded URL: ${decoded}`);
-
-                // Si es video directo, devolverlo
-                if (/\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(decoded)) {
-                    return {
-                        server: _server,
-                        headers: { "Referer": iframeUrl, "Origin": this.baseUrl },
-                        videoSources: [{ url: decoded, type: decoded.includes('.m3u8') ? "m3u8" : "mp4", quality: "default", subtitles: [] }],
-                    };
-                }
-
-                // Fetch y buscar iframe del servidor (solo si el servidor tiene dominios definidos)
-                const domains = this.serverDomains[serverLower] || [];
-                const playerRes = await fetch(decoded, {
-                    headers: { "Referer": episodeUrl, "User-Agent": "Mozilla/5.0 ...", "Origin": this.baseUrl },
-                });
-                if (!playerRes.ok) throw new Error(`Failed to fetch decoded URL (status ${playerRes.status})`);
-                const playerHtml = await playerRes.text();
-
-                // Buscar iframe con dominio del servidor
-                const iframeRegex = /<iframe[^>]+src=["']([^"']+)["']/gi;
-                let finalUrl: string | null = null;
-                let iframeMatch;
-                while ((iframeMatch = iframeRegex.exec(playerHtml)) !== null) {
-                    const src = iframeMatch[1];
-                    if (domains.some(d => src.toLowerCase().includes(d))) {
-                        finalUrl = src;
-                        break;
-                    }
-                }
-                if (!finalUrl) {
-                    const genericIframe = playerHtml.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-                    if (genericIframe && genericIframe[1] && !genericIframe[1].includes('nika.playmudos.com')) {
-                        finalUrl = genericIframe[1];
-                    }
-                }
-                if (!finalUrl) {
-                    let streamUrl = this._extractStreamFromPage(playerHtml, decoded);
-                    if (streamUrl && !streamUrl.includes('nika.playmudos.com')) {
-                        console.log(`🎬 Extracted stream URL (fallback): ${streamUrl}`);
-                        const isM3u8 = /\.m3u8/i.test(streamUrl);
-                        return { server: _server, headers: { "Referer": decoded, "Origin": this.baseUrl }, videoSources: [{ url: streamUrl, type: isM3u8 ? "m3u8" : "mp4", quality: "default", subtitles: [] }] };
-                    }
-                    throw new Error(`No valid video URL found for ${_server}`);
-                }
-                if (!finalUrl.startsWith('http')) finalUrl = new URL(finalUrl, decoded).toString();
-                console.log(`🎬 Final video URL: ${finalUrl}`);
-                const isM3u8 = /\.m3u8/i.test(finalUrl);
-                return { server: _server, headers: { "Referer": decoded, "Origin": this.baseUrl }, videoSources: [{ url: finalUrl, type: isM3u8 ? "m3u8" : "mp4", quality: "default", subtitles: [] }] };
+            let serversData: any[];
+            try {
+                // Intentar parsear el JSON (puede contener comillas simples, etc.)
+                const jsonStr = serversMatch[1]
+                    .replace(/'/g, '"')           // Reemplazar comillas simples por dobles
+                    .replace(/([{,]\s*)(\w+):/g, '$1"$2":'); // Poner comillas a las claves
+                serversData = JSON.parse(jsonStr);
+            } catch (e) {
+                throw new Error(`Failed to parse servers array: ${e.message}`);
             }
 
-            // -----------------------------------------------------------------
-            // Caso 2: Tiene 'e' → buscar enlace de descarga directa
-            // -----------------------------------------------------------------
-            if (eParam && eParam.length > 0) {
-                console.log(`🔑 Found 'e' parameter, looking for download link`);
-
-                // Buscar en el HTML el enlace de descarga para este servidor
-                // La regex busca el nombre del servidor, luego "Descargar HD" y captura la URL
-                const downloadRegex = new RegExp(
-                    `${serverLower}[\\s\\S]*?Descargar\\s*HD[\\s\\S]*?href=["']([^"']+)["']`,
-                    'i'
-                );
-                const downloadMatch = html.match(downloadRegex);
-                if (downloadMatch && downloadMatch[1]) {
-                    const directUrl = downloadMatch[1];
-                    console.log(`🎬 Found direct download URL for ${_server}: ${directUrl}`);
-                    let finalUrl = directUrl;
-                    if (!finalUrl.startsWith('http')) {
-                        finalUrl = new URL(finalUrl, this.baseUrl).toString();
-                    }
-                    const isM3u8 = /\.m3u8/i.test(finalUrl);
-                    return {
-                        server: _server,
-                        headers: {
-                            "Referer": episodeUrl,
-                            "Origin": this.baseUrl,
-                        },
-                        videoSources: [
-                            {
-                                url: finalUrl,
-                                type: isM3u8 ? "m3u8" : "mp4",
-                                quality: "default",
-                                subtitles: [],
-                            },
-                        ],
-                    };
-                }
-
-                // Si no se encuentra el enlace de descarga, intentar extraer iframe del player
-                console.log(`⚠️ No download link found, falling back to iframe extraction`);
-                const playerRes = await fetch(iframeUrl, {
-                    headers: { "Referer": episodeUrl, "Origin": this.baseUrl, "User-Agent": "Mozilla/5.0 ..." },
-                });
-                if (!playerRes.ok) throw new Error(`Failed to fetch player page (status ${playerRes.status})`);
-                const playerHtml = await playerRes.text();
-
-                // Buscar iframe con dominio del servidor
-                const domains = this.serverDomains[serverLower] || [];
-                const iframeRegex = /<iframe[^>]+src=["']([^"']+)["']/gi;
-                let finalUrl: string | null = null;
-                let iframeMatch;
-                while ((iframeMatch = iframeRegex.exec(playerHtml)) !== null) {
-                    const src = iframeMatch[1];
-                    if (domains.some(d => src.toLowerCase().includes(d))) {
-                        finalUrl = src;
-                        break;
-                    }
-                }
-                if (!finalUrl) {
-                    const domainPattern = domains.map(d => d.replace(/\./g, '\\.')).join('|');
-                    const urlRegex = new RegExp(`(https?://(?:${domainPattern})[^\\s'"]+)`, 'i');
-                    const urlMatch = playerHtml.match(urlRegex);
-                    if (urlMatch && urlMatch[1]) {
-                        finalUrl = urlMatch[1];
-                    }
-                }
-                if (!finalUrl) {
-                    const genericIframe = playerHtml.match(/<iframe[^>]+src=["']([^"']+)["']/i);
-                    if (genericIframe && genericIframe[1] && !genericIframe[1].includes('nika.playmudos.com')) {
-                        finalUrl = genericIframe[1];
-                    }
-                }
-                if (!finalUrl) {
-                    let streamUrl = this._extractStreamFromPage(playerHtml, iframeUrl);
-                    if (streamUrl && !streamUrl.includes('nika.playmudos.com')) {
-                        console.log(`🎬 Extracted stream URL (fallback): ${streamUrl}`);
-                        const isM3u8 = /\.m3u8/i.test(streamUrl);
-                        return { server: _server, headers: { "Referer": iframeUrl, "Origin": this.baseUrl }, videoSources: [{ url: streamUrl, type: isM3u8 ? "m3u8" : "mp4", quality: "default", subtitles: [] }] };
-                    }
-                    throw new Error(`No valid video URL found for ${_server}`);
-                }
-                if (!finalUrl.startsWith('http')) finalUrl = new URL(finalUrl, iframeUrl).toString();
-                console.log(`🎬 Final video URL: ${finalUrl}`);
-                const isM3u8 = /\.m3u8/i.test(finalUrl);
-                return { server: _server, headers: { "Referer": iframeUrl, "Origin": this.baseUrl }, videoSources: [{ url: finalUrl, type: isM3u8 ? "m3u8" : "mp4", quality: "default", subtitles: [] }] };
+            // Buscar el servidor por nombre (case-insensitive)
+            const serverEntry = serversData.find((s: any) => 
+                s.server && s.server.toLowerCase() === serverLower
+            );
+            if (!serverEntry) {
+                throw new Error(`Server "${_server}" not found in servers array.`);
             }
 
-            // -----------------------------------------------------------------
-            // Caso 3: No tiene ni 'u' ni 'e' → error
-            // -----------------------------------------------------------------
-            throw new Error(`No 'u' or 'e' parameter found in player_conte iframe. URL: ${iframeUrl}`);
+            // Decodificar el campo 'remote' (base64)
+            const remoteBase64 = serverEntry.remote;
+            if (!remoteBase64) {
+                throw new Error(`No 'remote' field for server "${_server}".`);
+            }
+
+            // Decodificar base64 URL-safe
+            const base64 = remoteBase64.replace(/-/g, '+').replace(/_/g, '/');
+            const pad = base64.length % 4;
+            const padded = pad ? base64 + '='.repeat(4 - pad) : base64;
+            let decodedUrl = '';
+            if (typeof Buffer !== 'undefined') {
+                decodedUrl = Buffer.from(padded, 'base64').toString('utf-8');
+            } else {
+                decodedUrl = atob(padded);
+            }
+
+            console.log(`🎬 Decoded remote URL for ${_server}: ${decodedUrl}`);
+
+            // Detectar tipo de video
+            const type = await this._detectVideoType(decodedUrl);
+
+            return {
+                server: _server,
+                headers: {
+                    "Referer": episodeUrl,
+                    "Origin": this.baseUrl,
+                },
+                videoSources: [
+                    {
+                        url: decodedUrl,
+                        type,
+                        quality: "default",
+                        subtitles: [],
+                    },
+                ],
+            };
 
         } catch (error) {
             console.error(`❌ Error in findEpisodeServer for "${_server}":`, error);
