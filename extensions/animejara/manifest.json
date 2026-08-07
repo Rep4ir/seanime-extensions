@@ -3,7 +3,7 @@
     "name": "AnimeJara",
     "description": "AnimeJara - catalogo de anime en español con subtitulos y doblaje al castellano y latino.",
     "manifestURI": "https://raw.githubusercontent.com/Rep4ir/anime/refs/heads/main/extensions/animejara/manifest.json",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "author": "Rep4ir",
     "type": "onlinestream-provider",
     "language": "typescript",

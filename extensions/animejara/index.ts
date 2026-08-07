@@ -17,31 +17,59 @@
  *   same code path is the only thing that would need touching — every method
  *   already shares `_get`/`_getHtml`.
  *
- * Audio-variant strategy
- *   AnimeJara stores, per episode, the list of available audio tracks
- *   (typically "JAPONES" = subbed Japanese, "LATINO" = Spanish dub; some
- *   titles are sub-only or dub-only, many are both). For every (episode,
- *   audio) pair we emit a separate `EpisodeDetails` entry so the user can
- *   pick the variant they want. The variant is encoded in `id` with a
- *   stable, parseable shape:
+ * Sub / Dub strategy (see Seanime online-streaming-provider contract)
+ *   AnimeJara keeps, per episode, a list of available audio tracks
+ *   (typically "JAPONES" = subbed Japanese, "LATINO" / "CASTELLANO" /
+ *   "ESPAÑOL" = Spanish dubs; some titles are sub-only or dub-only, many
+ *   are both).
  *
- *       {kind}:{slug}::S{season}::E{episode}::{AUDIO}
+ *   Seanime content providers have no DOM access, so the player's sub/dub
+ *   toggle (the <div data-vc-element> "Switch to Dub" button) cannot be
+ *   observed directly. The only documented channel from the UI to a
+ *   provider is `SearchOptions.dub`, which Seanime passes to `search`
+ *   whenever the user toggles the mode. We therefore encode the requested
+ *   mode into the `SearchResult.id` we return:
  *
- *   e.g.  anime:sentai-daishikkaku::S1::E23::LATINO
- *         movie:la-leyenda-de-aang-el-ultimo-maestro-aire::S1::E1::JAPONES
+ *       {kind}:{slug}              // sub mode (opts.dub === false)
+ *       {kind}:{slug}::DUB         // dub mode (opts.dub === true)
  *
- *   `findEpisodeServer` parses that id, hits the corresponding /episode/
- *   (or /movie/) page, locates the per-language embed URL from the
- *   `enlaces` / `movieLinks` JS array (kept in the same order as the
- *   `botones-idioma` buttons), then lists every mirror returned by the
- *   embed page (filemoon, voe, vidhide, streamhg, …) as a separate
- *   `videoSources` entry.
+ *   `findEpisodes` strips the trailing `::DUB` selector off the id to learn
+ *   the active mode, then emits ONE EpisodeDetails per episode number
+ *   (never per audio variant), encoding the mode in the episode id
  *
- *   The mirror URLs are external-host embed pages (e.g.
- *   https://filemoon…/e/xyz) whose real stream link is produced by
- *   client-side JavaScript; they are returned with `type: "unknown"` so
- *   Seanime's player loads them in its JS-capable webview — same approach
- *   as the jkanime/kwik reference extension.
+ *       {kind}:{slug}::S{season}::E{episode}::{MODE}    // MODE = "SUB" | "DUB"
+ *
+ *   This is what eliminates the duplicate episodes reported in production:
+ *   an anime with sub + latino + castellano used to produce three rows per
+ *   episode; now every episode has a single slot, regardless of how many
+ *   dubs it has.
+ *
+ *   `findEpisodeServer` parses the MODE, fetches the /episode/ (or /movie/)
+ *   page once, walks the `enlaces`/`movieLinks` array in step with the
+ *   `.botones-idioma` audio buttons, and keeps only the embed URLs that
+ *   correspond to the active mode (sub ⇒ only JAPONES; dub ⇒ every
+ *   non-JAPONES track). For each (embed URL × mirror) pair it then
+ *   resolves the real `.m3u8` / `.mp4` stream URL by fetching the embed
+ *   page and decoding the hoster's payload (VOE base64, filemoon/vidhide
+ *   eval-packer, generic regex fallback), and emits one `VideoSource`
+ *   per (mirror, language), tagged with the language in `quality`
+ *   (e.g. "VOE - Latino") and `label` (e.g. "Latino").
+ *
+ *   The user therefore selects the language by picking a server from the
+ *   server list — exactly the desired UX.
+ *
+ * Playback note (HLS)
+ *   Mirrors are external-host embed PAGES (e.g. https://filemoon…/e/xyz)
+ *   whose body is HTML, not an HLS playlist. Seanime's built-in player
+ *   passes `videoSources[].url` straight to an HLS parser when
+ *   `type === "m3u8"`. Returning the embed URL with `type: "unknown"`
+ *   (the previous behaviour) made the parser download the HTML embed
+ *   page and try to read #EXTM3U out of it — producing the production
+ *   error "HLS error: no EXTM3U delimiter". The playground masked this
+ *   because it ran the embed pages through an internal JS-capable
+ *   webview, but that path is not part of the documented contract. The
+ *   fix here is to resolve the real stream URL host-side (same approach
+ *   as the kwik example in the Seanime docs) and tag it `"m3u8"` / `"mp4"`.
  */
 
 class Provider {
@@ -147,10 +175,17 @@ class Provider {
     private _audioLabel(audio: string): string {
         const a = (audio || "").toUpperCase()
         if (a === "JAPONES") return "SUB"
-        if (a === "LATINO") return "LATINO"
-        if (a === "ESPAÑOL" || a === "ESPANOL") return "ESP"
-        if (a === "CASTELLANO") return "CAST"
+        if (a === "LATINO") return "Latino"
+        if (a === "ESPAÑOL" || a === "ESPANOL") return "Español"
+        if (a === "CASTELLANO") return "Castellano"
         return a || "SUB"
+    }
+
+    // Whether a given audio tag counts as a dub (i.e. anything other than the
+    // Japanese/subbed track). Used to bucket audios into the SUB or DUB mode.
+    private _isDubAudio(audio: string): boolean {
+        const a = (audio || "").toUpperCase()
+        return a !== "JAPONES" && a !== "" && a !== "SUB"
     }
 
     // ---------------------------------------------------------------------------
@@ -196,14 +231,16 @@ class Provider {
             const kind = isMovie ? "movie" : "anime"
             const url = `${this.baseUrl}/${kind}/${slug}`
 
-            // We don't know the audio make-up until we read the title page, so
-            // default to "both" when dubs are supported. This is purely a hint
-            // for the Seanime UI; the per-episode truth comes from
-            // `findEpisodes`.
-            const subOrDub: SubOrDub = opts.dub ? "both" : "sub"
+            // Encode the player's sub/dub mode into the content id so that
+            // `findEpisodes` (which receives no `dub` flag of its own) can
+            // serve the right episode set. `opts.dub === true` means the
+            // user clicked "Switch to Dub"; `false` is the default sub mode.
+            // We keep `subOrDub: "both"` so Seanime keeps the toggle visible.
+            const modeSuffix = opts.dub ? "::DUB" : ""
+            const subOrDub: SubOrDub = "both"
 
             return {
-                id: `${kind}:${slug}`,
+                id: `${kind}:${slug}${modeSuffix}`,
                 title: a.titulo || slug,
                 url: url,
                 subOrDub: subOrDub,
@@ -221,13 +258,17 @@ class Provider {
     // ---------------------------------------------------------------------------
 
     async findEpisodes(id: string): Promise<EpisodeDetails[]> {
-        const { kind, slug } = this._parseContentId(id)
+        const { contentId, wantsDub } = this._parseContentIdWithMode(id)
+        const { kind, slug } = this._parseContentId(contentId)
         const url = `${this.baseUrl}/${kind}/${slug}`
 
         const html = await this._getHtml(url, this.baseUrl + "/inicio")
         const temporadas = this._extractTemporadasData(html)
 
         const episodes: EpisodeDetails[] = []
+        // MODE is encoded into every episode id so `findEpisodeServer` knows
+        // which audio variants to expose as servers.
+        const MODE = wantsDub ? "DUB" : "SUB"
 
         if (temporadas && temporadas.length > 0) {
             // ---- Series: TEMPORADAS_DATA carries seasons + per-episode audios.
@@ -241,34 +282,46 @@ class Provider {
                     if (!Number.isInteger(epNum)) continue
 
                     const idiomas: string[] = Array.isArray(ep.idiomas) ? ep.idiomas : []
-                    // If the JSON omitted idiomas (older entries), default to SUB.
                     const audios = idiomas.length > 0 ? idiomas : ["JAPONES"]
+
+                    // Only emit this episode if it has at least one source in
+                    // the active mode. (If an anime has dub-only episodes and
+                    // the user is in sub mode, those become invisible — but
+                    // they will reappear the moment the user clicks "Switch
+                    // to Dub", because that re-runs `search` with dub=true and
+                    // produces the dub-mode ids.)
+                    const hasForMode = wantsDub
+                        ? audios.some((a) => this._isDubAudio(a))
+                        : audios.some((a) => !this._isDubAudio(a))
+                    if (!hasForMode) continue
 
                     const epTitle: string = (ep.nombre_episodio || "").trim()
                     const epUrl = `${this.baseUrl}/episode/${slug}-${seasonNum}x${epNum}/`
 
-                    for (const audio of audios) {
-                        const label = this._audioLabel(audio)
-                        episodes.push({
-                            id: `${kind}:${slug}::S${seasonNum}::E${epNum}::${audio.toUpperCase()}`,
-                            number: epNum,
-                            url: epUrl,
-                            title: epTitle || `Episodio ${epNum}${audios.length > 1 ? ` (${label})` : ""}`,
-                        })
-                    }
+                    episodes.push({
+                        id: `${kind}:${slug}::S${seasonNum}::E${epNum}::${MODE}`,
+                        number: epNum,
+                        url: epUrl,
+                        title: epTitle || `Episodio ${epNum}`,
+                    })
                 }
             }
         } else if (kind === "movie") {
-            // ---- Movies: no seasons JSON; the /movie/{slug} page is itself the
-            // episode 1 view. Read the per-audio embed list there.
+            // ---- Movies: no seasons JSON; the /movie/{slug} page is itself
+            // the episode 1 view. The page lists the available audios; emit
+            // at most one entry (mode-tagged) for episode 1, regardless of
+            // how many dubs it has.
             const audios = this._extractPageAudios(html)
             const list = (audios.length > 0 ? audios : ["JAPONES"]) as string[]
-            for (const audio of list) {
+            const hasForMode = wantsDub
+                ? list.some((a) => this._isDubAudio(a))
+                : list.some((a) => !this._isDubAudio(a))
+            if (hasForMode) {
                 episodes.push({
-                    id: `${kind}:${slug}::S1::E1::${audio.toUpperCase()}`,
+                    id: `${kind}:${slug}::S1::E1::${MODE}`,
                     number: 1,
                     url: url,
-                    title: `Película (${this._audioLabel(audio)})`,
+                    title: "Película",
                 })
             }
         }
@@ -297,35 +350,98 @@ class Provider {
 
         const html = await this._getHtml(pageUrl, this.baseUrl + "/")
 
-        // Locate the embed-URL array that matches the requested audio variant.
-        const embedUrl = this._extractEmbedUrlForAudio(html, meta.audio)
-        if (!embedUrl) {
+        // Collect every (audio, embedUrl) pair available on the page, then
+        // keep only the ones that match the active mode (sub ⇒ JAPONES only;
+        // dub ⇒ everything else). For multi-dub anime this yields one entry
+        // per language (e.g. latino + castellano), so the user picks between
+        // them via the server list — never via duplicate episode rows.
+        const allAudios = this._extractPageAudios(html)
+        const allLinks = this._extractEmbedLinks(html)
+        const pairs: Array<{ audio: string; embedUrl: string }> = []
+        if (allAudios.length === allLinks.length && allLinks.length > 0) {
+            for (let i = 0; i < allLinks.length; i++) {
+                const audio = (allAudios[i] || "").toUpperCase()
+                const isDub = this._isDubAudio(audio)
+                if (meta.wantsDub === isDub) {
+                    pairs.push({ audio, embedUrl: this._decodeEntities(allLinks[i]) })
+                }
+            }
+        } else if (allLinks.length > 0) {
+            // Page didn't expose the audio buttons in a parseable way — fall
+            // back to the first embed only, and (if we're in dub mode) treat
+            // it as a dub so we still surface something.
+            const fallbackAudio = meta.wantsDub ? "LATINO" : "JAPONES"
+            pairs.push({ audio: fallbackAudio, embedUrl: this._decodeEntities(allLinks[0]) })
+        }
+
+        if (pairs.length === 0) {
             throw new Error(
-                `No embed found for "${meta.slug}" S${meta.season}E${meta.episode} (${meta.audio}).`
+                `No ${meta.wantsDub ? "dub" : "sub"} source found for "${meta.slug}" ` +
+                `S${meta.season}E${meta.episode}.`
             )
         }
 
-        // Pull the list of mirror servers from the embed page.
-        const mirrors = await this._extractMirrors(embedUrl, pageUrl)
-        if (mirrors.length === 0) {
-            // Last-ditch fallback: surface the animejara embed itself. Seanime's
-            // player can render the iframe, which in turn shows the server list.
-            mirrors.push({ name: "AnimeJara", url: embedUrl })
+        const videoSources: VideoSource[] = []
+
+        for (const pair of pairs) {
+            // The embed page (streamhj multiplayer) lists the actual mirror
+            // hosters (filemoon, voe, vidhide, …) as <li onclick="playVideo">.
+            const mirrors = await this._extractMirrors(pair.embedUrl, pageUrl)
+            if (mirrors.length === 0) {
+                // No mirror scraped — last-ditch: surface the embed itself
+                // and let the hoster extraction try it as a single mirror.
+                mirrors.push({ name: "AnimeJara", url: pair.embedUrl })
+            }
+
+            const langLabel = this._audioLabel(pair.audio)
+
+            for (const mirror of mirrors) {
+                // The mirror URL is an HTML embed PAGE, not a stream. Resolve
+                // the real .m3u8/.mp4 URL host-side so the HLS player gets a
+                // proper playlist instead of "no EXTM3U delimiter".
+                const resolved = await this._resolveMirrorStream(mirror.url, pair.embedUrl)
+                if (!resolved) continue
+
+                videoSources.push({
+                    url: resolved.url,
+                    type: resolved.type,
+                    // quality must be unique across videoSources; combining the
+                    // mirror name with the language tag guarantees that even
+                    // when the same hoster appears under two dubs.
+                    quality: `${mirror.name} - ${langLabel}`,
+                    label: langLabel,
+                    subtitles: [],
+                })
+            }
         }
 
-        const audioLabel = this._audioLabel(meta.audio)
-        const videoSources: VideoSource[] = mirrors.map((m) => ({
-            url: m.url,
-            type: "unknown" as VideoSourceType,
-            quality: `${m.name} - ${audioLabel}`,
-            label: audioLabel,
-            subtitles: [],
-        }))
+        if (videoSources.length === 0) {
+            throw new Error(
+                `Could not resolve any playable stream for "${meta.slug}" ` +
+                `S${meta.season}E${meta.episode} (${meta.wantsDub ? "dub" : "sub"}).`
+            )
+        }
+
+        // Prefer the requested server / language if present; otherwise default
+        // to the first resolved source. The `server` field is informational —
+        // Seanime switches between videoSources using their `quality`.
+        let chosenServer = server || videoSources[0].quality
+        if (!videoSources.some((v) => v.quality === server)) {
+            chosenServer = videoSources[0].quality
+        }
+
+        // Headers are sent on every segment request the HLS player makes, so
+        // we point Referer at the embed page's host (the hoster checks it).
+        let refererHost = pageUrl
+        try {
+            const u = new URL(pairs[0].embedUrl)
+            refererHost = `${u.protocol}//${u.host}/`
+        } catch { /* keep pageUrl fallback */ }
 
         return {
-            server: server || mirrors[0].name,
+            server: chosenServer,
             headers: {
-                Referer: pageUrl,
+                Referer: refererHost,
                 Origin: this.baseUrl,
             },
             videoSources: videoSources,
@@ -335,6 +451,24 @@ class Provider {
     // ===========================================================================
     // Parsing helpers
     // ===========================================================================
+
+    /**
+     * Parse a content-level id coming from `search`. The id may carry a
+     * trailing `::DUB` selector that encodes the active sub/dub mode:
+     *
+     *   "anime:slug"        → sub mode
+     *   "anime:slug::DUB"   → dub mode
+     *
+     * Returns both the stripped content id (for `_parseContentId`) and the
+     * boolean `wantsDub`.
+     */
+    private _parseContentIdWithMode(id: string): { contentId: string; wantsDub: boolean } {
+        const raw = id || ""
+        if (raw.endsWith("::DUB")) {
+            return { contentId: raw.slice(0, -("::DUB".length)), wantsDub: true }
+        }
+        return { contentId: raw, wantsDub: false }
+    }
 
     /**
      * Parse a content-level id ("anime:slug" / "movie:slug") coming from `search`.
@@ -355,23 +489,23 @@ class Provider {
 
     /**
      * Parse an episode-level id produced by `findEpisodes`:
-     *   {kind}:{slug}::S{season}::E{episode}::{AUDIO}
+     *   {kind}:{slug}::S{season}::E{episode}::{MODE}   // MODE = "SUB" | "DUB"
      */
     private _parseEpisodeId(id: string): {
         kind: "anime" | "movie"
         slug: string
         season: number
         episode: number
-        audio: string
+        wantsDub: boolean
     } | null {
-        const m = id.match(/^(anime|movie):(.+?)::S(\d+)::E(\d+)::([^:]+)$/)
+        const m = id.match(/^(anime|movie):(.+?)::S(\d+)::E(\d+)::(SUB|DUB)$/)
         if (!m) return null
         return {
             kind: m[1] as "anime" | "movie",
             slug: m[2],
             season: Number(m[3]),
             episode: Number(m[4]),
-            audio: m[5],
+            wantsDub: m[5] === "DUB",
         }
     }
 
@@ -440,27 +574,6 @@ class Provider {
             }
         }
         return audios
-    }
-
-    /**
-     * From an episode or movie page, return the multiplayer embed URL that
-     * corresponds to the requested audio variant. The page keeps the per-audio
-     * embed URLs in a JS array (`enlaces` for episodes, `movieLinks` for
-     * movies), in the same order as the `.botones-idioma` buttons.
-     */
-    private _extractEmbedUrlForAudio(html: string, audio: string): string | undefined {
-        const audios = this._extractPageAudios(html)
-        const links = this._extractEmbedLinks(html)
-        if (links.length === 0) return undefined
-
-        // If we managed to read both lists and lengths line up, index by audio.
-        if (audios.length === links.length) {
-            const idx = audios.indexOf(audio.toUpperCase())
-            if (idx >= 0) return this._decodeEntities(links[idx])
-        }
-
-        // Otherwise, fall back to the first link (the page's default variant).
-        return this._decodeEntities(links[0])
     }
 
     /**
@@ -582,6 +695,235 @@ class Provider {
         }
 
         return mirrors
+    }
+
+    // ===========================================================================
+    // Mirror → real stream URL resolution (fix for "no EXTM3U delimiter").
+    // ===========================================================================
+    //
+    // The mirror URLs returned by `_extractMirrors` are HTML embed PAGES, not
+    // streams. Seanime's built-in player feeds `videoSources[].url` straight
+    // to an HLS/MP4 parser as soon as `type` is "m3u8"/"mp4"; if we returned
+    // the embed URL with `type: "unknown"` (old behaviour), the parser got
+    // back the embed's HTML body and produced "HLS error: no EXTM3U
+    // delimiter". We must resolve the real stream URL host-side, exactly like
+    // the kwik example in the Seanime docs does for its `eval` payload.
+
+    /**
+     * Fetch a mirror's embed page and extract the actual stream URL+type.
+     * Returns null if nothing usable was found.
+     */
+    private async _resolveMirrorStream(
+        embedUrl: string,
+        referer: string
+    ): Promise<{ url: string; type: VideoSourceType } | null> {
+        let html: string
+        try {
+            const res = await fetch(embedUrl, {
+                headers: {
+                    "User-Agent": Provider.UA,
+                    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                    "Referer": referer,
+                    "Sec-Fetch-Dest": "iframe",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+                timeout: 35,
+            })
+            if (res.status !== 200) return null
+            html = res.text()
+            // Normalise once: VOE/filemoon emit literal \x.. escape sequences
+            // in obfuscated payloads; decoding them up-front lets the regex
+            // extractors work on the same string regardless of hoster.
+            html = this._decodeEscapeSequences(this._decodeEntities(html))
+        } catch {
+            return null
+        }
+
+        // If the URL itself is already a direct stream, trust it.
+        if (/\.(m3u8|mp4|webm|mkv)(\?.*)?$/i.test(embedUrl)) {
+            return {
+                url: embedUrl,
+                type: /\.m3u8(\?.*)?$/i.test(embedUrl) ? "m3u8" : "mp4",
+            }
+        }
+
+        // Host-specific extraction. Order matters: VOE has the strongest
+        // signal (mk hosts / fp/voe-* subdomains) and a known payload, so we
+        // try it first; the eval-packer covers filemoon/vidhide/streamhg;
+        // the generic regex is the safety net.
+        const host = (() => {
+            try { return new URL(embedUrl).hostname.toLowerCase() } catch { return "" }
+        })()
+
+        if (host.indexOf("voe") === 0 || host.indexOf("voe-") >= 0 || host.indexOf(".voe.") >= 0) {
+            const r = this._voeExtract(html)
+            if (r) return { url: r, type: (r.indexOf(".m3u8") >= 0 ? "m3u8" : "mp4") as VideoSourceType }
+        }
+
+        const packed = this._packedExtract(html)
+        if (packed) {
+            const ext = /\.m3u8(\?.*)?$/i.test(packed) ? "m3u8"
+                : /\.mp4(\?.*)?$/i.test(packed) ? "mp4"
+                : /\.webm(\?.*)?$/i.test(packed) ? "mp4"
+                : ""
+            if (ext) return { url: packed, type: ext as VideoSourceType }
+        }
+
+        // Generic regex sweep — final fallback, covers Streamhg/Nosatpel/
+        // generic players that inline an m3u8 in a <source> or window var.
+        const generic = this._genericStreamExtract(html, embedUrl)
+        if (generic) return generic
+
+        return null
+    }
+
+    /**
+     * VOE extractor. VOE embeds either a JSON `sources` array (possibly
+     * doubly-escaped), a `var mp4 = [...]` array, or a packed string. We
+     * scan for the first http(s) URL that ends in `.m3u8` or `.mp4` in that
+     * order, then fall back to a regex sweep for the same extensions.
+     */
+    private _voeExtract(html: string): string | null {
+        // 1) JSON sources array: {"sources":[{"file":"https://...m3u8",...}]}
+        const srcArr = html.match(/['"]sources['"]\s*:\s*\[[\s\S]*?\]/)
+        if (srcArr) {
+            const urls = srcArr[0].match(/https?:\/\/[^\s'"\\]+/g) || []
+            for (const u of urls) {
+                if (/\.m3u8(\?.*)?$/i.test(u)) return this._safeUrl(u)
+                if (/\.mp4(\?.*)?$/i.test(u)) return this._safeUrl(u)
+            }
+        }
+        // 2) var mp4 = ["https://...mp4", "https://...m3u8", ...]
+        const mp4Arr = html.match(/(?:var|let|const)\s+mp4\s*=\s*\[[\s\S]*?\]/)
+        if (mp4Arr) {
+            const urls = mp4Arr[0].match(/https?:\/\/[^\s'"\\]+/g) || []
+            for (const u of urls) {
+                if (/\.m3u8(\?.*)?$/i.test(u)) return this._safeUrl(u)
+                if (/\.mp4(\?.*)?$/i.test(u)) return this._safeUrl(u)
+            }
+        }
+        // 3) window.location* redirects to an m3u8 — capture any plain URL.
+        const direct = html.match(/(https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)/i)
+        if (direct && direct[1]) return this._safeUrl(direct[1])
+        const directMp4 = html.match(/(https?:\/\/[^\s"'<>\\]+\.mp4[^\s"'<>\\]*)/i)
+        if (directMp4 && directMp4[1]) return this._safeUrl(directMp4[1])
+        return null
+    }
+
+    /**
+     * Filemoon / VidHide / StreamHub extractor. These hosters ship a
+     * `eval(function(p,a,c,k,e,d){...})` packer whose decoded form contains
+     * `file:"<stream-url>"` or `sources:[{file:"<stream-url>"}]`. We run the
+     * packer in-sandbox (Seanime's JS engine supports `eval`) and sweep the
+     * decoded string for the stream URL — same approach the kwik example in
+     * the Seanime docs uses.
+     */
+    private _packedExtract(html: string): string | null {
+        // Match the packed payload, optionally over multiple lines.
+        const m = html.match(/eval\(function\(p,a,c,k,e,d\)\{[\s\S]*?\}\)\)/)
+        if (!m) return null
+
+        // Run the packer in-sandbox. Seanime's goja JS engine supports
+        // eval; the packer's own code is self-contained and safe enough.
+        let decoded = ""
+        try {
+            // The packer calls `eval(...)` to materialise its payload. Eval'ing
+            // the whole `eval(...)` expression is exactly what the hoster's
+            // page does, returning the unpacked JavaScript source.
+            decoded = String(eval(m[0]))
+        } catch {
+            // If eval is unavailable or fails, try the manual unpack: the
+            // decoded token list is in the `|`-delimited string near the end.
+            const inner = m[0].match(/'([^']{8,})'\.split\('\|'\)/)
+            if (!inner) return null
+            const tokens = inner[1].split("|")
+            // Re-hydrate the template portion: find the first token that
+            // looks like a URL.
+            for (const t of tokens) {
+                if (/^https?:\/\//i.test(t) && /\.(m3u8|mp4|webm)(\?.*)?$/i.test(t)) {
+                    return this._safeUrl(t)
+                }
+            }
+            return null
+        }
+        if (!decoded) return null
+
+        // Search the decoded payload for the stream URL. Match the common
+        // assignments first (file:"<url>", source:"<url>", sources:[...]).
+        const fileMatch = decoded.match(/['"]?file['"]?\s*[:=]\s*['"]([^'"]+\.(?:m3u8|mp4|webm)[^'"]*)['"]/i)
+        if (fileMatch && fileMatch[1]) return this._safeUrl(fileMatch[1])
+        const srcMatch = decoded.match(/['"]?src['"]?\s*[:=]\s*['"]([^'"]+\.(?:m3u8|mp4|webm)[^'"]*)['"]/i)
+        if (srcMatch && srcMatch[1]) return this._safeUrl(srcMatch[1])
+        const sourcesArr = decoded.match(/['"]?sources['"]?\s*[:=]\s*\[[\s\S]*?\]/)
+        if (sourcesArr) {
+            const urls = sourcesArr[0].match(/https?:\/\/[^\s'"\\]+/g) || []
+            for (const u of urls) {
+                if (/\.(m3u8|mp4|webm)(\?.*)?$/i.test(u)) return this._safeUrl(u)
+            }
+        }
+        // Last sweep on the decoded string.
+        const raw = decoded.match(/(https?:\/\/[^\s"'<>\\]+\.(?:m3u8|mp4|webm)[^\s"'<>\\]*)/i)
+        if (raw && raw[1]) return this._safeUrl(raw[1])
+        return null
+    }
+
+    /**
+     * Generic stream URL extractor. Tries the patterns used by the kwik
+     * reference extension (source=, video src=, m3u8 in <source>,
+     * hls.loadSource, plain "file":), then a final regex sweep.
+     */
+    private _genericStreamExtract(html: string, embedUrl: string): { url: string; type: VideoSourceType } | null {
+        const patterns: RegExp[] = [
+            /(?:file|src|video_url|source|url)\s*[:=]\s*["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            /<source\s+src=["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            /hls\.loadSource\(\s*["']([^"']+\.m3u8[^"']*)["']\s*\)/i,
+            /source=["']([^"']+\.(?:m3u8|mp4|webm)[^"']*)["']/i,
+            /["']file["']\s*:\s*["']([^"']+)["']/i,
+            /["']url["']\s*:\s*["']([^"']+)["']/i,
+            /(https?:\/\/[^\s'"]+\.(?:m3u8|mp4|webm)[^\s'"]*)/i,
+        ]
+        for (const p of patterns) {
+            const m = html.match(p)
+            if (m && m[1]) {
+                let url = m[1]
+                if (url.indexOf("//") === 0) url = "https:" + url
+                else if (url.indexOf("/") === 0) {
+                    try {
+                        const u = new URL(embedUrl)
+                        url = `${u.protocol}//${u.host}${url}`
+                    } catch { /* give up */ }
+                } else if (url.indexOf("http") !== 0) {
+                    try { url = new URL(url, embedUrl).toString() } catch { /* give up */ }
+                }
+                if (/^https?:\/\//i.test(url)) {
+                    const type: VideoSourceType = /\.m3u8(\?.*)?$/i.test(url) ? "m3u8" : "mp4"
+                    return { url: this._safeUrl(url), type }
+                }
+            }
+        }
+        return null
+    }
+
+    /**
+     * Decode \x.. and \u.... escape sequences that obfuscated hoster payloads
+     * embed in their HTML. Also normalises stray '\\u00' escapes. URLs and
+     * everything else pass through untouched (the canonical URL chars are all
+     * plain ASCII).
+     */
+    private _decodeEscapeSequences(s: string): string {
+        if (!s || s.indexOf("\\") < 0) return s
+        return s
+            .replace(/\\x([0-9a-fA-F]{2})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+            .replace(/\\u([0-9a-fA-F]{4})/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    }
+
+    /**
+     * Trim trailing junk that regexes sometimes capture (trailing commas,
+     * quotes, escaped slashes). Keeps the URL parser-friendly.
+     */
+    private _safeUrl(u: string): string {
+        return (u || "").replace(/[\\]+/g, "").replace(/["'<>\\]+$/g, "").trim()
     }
 }
 
