@@ -126,6 +126,7 @@ class Provider {
 
     // HTTP GET that returns text. Tolerates the 404 the site occasionally
     // answers with while still serving the correct body (broken WP rewrite).
+    // Also detects the "soft-404" gate (200 OK but body says "Episodio no encontrado en URL.").
     private async _getHtml(url: string, referer?: string): Promise<string> {
         const res = await fetch(url, {
             headers: this._baseHeaders(referer),
@@ -134,7 +135,18 @@ class Provider {
         if (res.status !== 200 && res.status !== 404) {
             throw new Error(`HTTP ${res.status} fetching ${url}`)
         }
-        return res.text()
+        const html = res.text()
+        // Detect the soft-404 gate: site returns 200 but with a stub page.
+        if (html.indexOf("Episodio no encontrado en URL") >= 0 ||
+            html.indexOf("Episodio no encontrado") >= 0) {
+            throw new Error(
+                `Soft-404 gate triggered for "${url}". ` +
+                `The site is blocking automated requests (Cloudflare/geo gate). ` +
+                `Open the episode page in a browser first to establish a session, ` +
+                `then retry.`
+            )
+        }
+        return html
     }
 
     // GET with one retry. Used for the Filemoon intermediate page, which can
@@ -150,12 +162,38 @@ class Provider {
         }
         if (referer) headers["Referer"] = referer
 
+        // For Filemoon/CDN domains, add extra headers that help bypass Cloudflare
+        const host = (() => { try { return new URL(url).hostname.toLowerCase() } catch { return "" } })()
+        const isFilemoonCdn = host.indexOf("filemoon") >= 0
+            || host.indexOf("bysekoze") >= 0
+            || host.indexOf("kiwi") >= 0
+            || host.indexOf("kkj") >= 0
+            || host.indexOf("ed33360e") >= 0
+            || host.indexOf(".sbs") > 0
+            || host.indexOf(".sx") > 0
+            || host.indexOf("sprintcdn") >= 0
+        if (isFilemoonCdn) {
+            headers["Accept"] = "*/*"
+            headers["Sec-Fetch-Dest"] = "empty"
+            headers["Sec-Fetch-Mode"] = "cors"
+            headers["Cache-Control"] = "no-cache"
+            headers["Pragma"] = "no-cache"
+        }
+
         for (let attempt = 0; attempt < 2; attempt++) {
             try {
                 const res = await fetch(url, { headers, timeout: 40 })
-                if (res.status === 200) return res.text()
-                if (res.status >= 500 && attempt === 0) continue // retry once
-                return null
+                if (res.status !== 200) {
+                    if (res.status >= 500 && attempt === 0) continue // retry once
+                    return null
+                }
+                const html = res.text()
+                // Detect soft-404 gate on retry path too
+                if (html.indexOf("Episodio no encontrado en URL") >= 0 ||
+                    html.indexOf("Episodio no encontrado") >= 0) {
+                    return null
+                }
+                return html
             } catch {
                 if (attempt === 0) continue // retry once on transport error
                 return null
@@ -356,10 +394,19 @@ class Provider {
             ? `${this.baseUrl}/movie/${meta.slug}`
             : `${this.baseUrl}/episode/${meta.slug}-${meta.season}x${meta.episode}/`
 
-        // Fetch with proper headers to bypass the soft-404 gate (the episode page
-        // only renders the player iframe + language buttons when it sees a real
-        // browser UA + Referer + Origin + Cloudflare challenge pass-through).
-        const html = await this._getHtml(pageUrl, this.baseUrl + "/")
+        // Try regular fetch first. If it hits the soft-404 gate, fall back to
+        // ChromeDP (headless Chrome) which can pass Cloudflare challenges.
+        let html: string
+        try {
+            html = await this._getHtml(pageUrl, this.baseUrl + "/")
+        } catch (e: any) {
+            const msg = String(e?.message || e)
+            if (msg.indexOf("Soft-404 gate") >= 0) {
+                html = await this._getHtmlWithChromeDP(pageUrl)
+            } else {
+                throw e
+            }
+        }
 
         // ---- Strategy 1: Server-rendered player block (real episode page).
         // Look for the canonical player wrapper + iframe + language buttons.
@@ -383,6 +430,34 @@ class Provider {
             `The site may be blocking the request (Cloudflare / geo gate). ` +
             `Try opening the page in a browser first to establish a session.`
         )
+    }
+
+    /**
+     * Fetch an episode page using ChromeDP (headless Chrome) to bypass
+     * Cloudflare/geo gates. Returns the page HTML after JS execution.
+     * This is slower but more reliable for gated pages.
+     */
+    private async _getHtmlWithChromeDP(url: string): Promise<string> {
+        let browser: any = null
+        try {
+            browser = await ChromeDP.newBrowser({ headless: true, timeout: 60 })
+            await browser.navigate(url)
+            // Wait for the player wrapper to appear (it's rendered server-side,
+            // but we also wait a bit for any dynamic content)
+            await browser.waitReady("#reproductor-wrapper", 30)
+            // Give a moment for any lazy-loaded iframes
+            await browser.sleep(2000)
+            return await browser.outerHTML("html")
+        } catch (e: any) {
+            throw new Error(
+                `ChromeDP failed to load episode page "${url}": ${e?.message || e}. ` +
+                `Ensure Chrome/Chromium is installed on the Seanime host.`
+            )
+        } finally {
+            if (browser) {
+                try { await browser.close() } catch { /* ignore */ }
+            }
+        }
     }
 
     /**
@@ -558,10 +633,16 @@ class Provider {
 
             // The multiplayer embed page hosts the Filemoon mirror <li>.
             const filemoonEmbedUrl = await this._extractFilemoonEmbedUrl(pair.embedUrl, pageUrl)
-            if (!filemoonEmbedUrl) continue // skip this language
+            if (!filemoonEmbedUrl) {
+                // Log for debugging: which language failed at embed extraction
+                continue // skip this language
+            }
 
             const stream = await this._resolveFilemoonStream(filemoonEmbedUrl, pair.embedUrl)
-            if (!stream) continue
+            if (!stream) {
+                // Log for debugging: which language failed at stream extraction
+                continue
+            }
 
             videoSources.push({
                 url: stream,
@@ -573,9 +654,13 @@ class Provider {
         }
 
         if (videoSources.length === 0) {
+            // Include debug info in error
+            const langs = pairs.map(p => this._audioLabel(p.audio)).join(", ")
             throw new Error(
                 `Could not resolve any Filemoon stream for "${meta.slug}" ` +
-                `S${meta.season}E${meta.episode} (${meta.wantsDub ? "dub" : "sub"}).`
+                `S${meta.season}E${meta.episode} (${meta.wantsDub ? "dub" : "sub"}). ` +
+                `Tried languages: ${langs}. ` +
+                `Check if episode page loads player iframe (soft-404 gate).`
             )
         }
 
@@ -821,9 +906,17 @@ class Provider {
         const isValidM3u8 = (url: string): boolean => {
             if (!/^https?:\/\//i.test(url)) return false
             if (!/\.m3u8(\?.*)?$/i.test(url)) return false
-            if (url.indexOf("hls2") < 0) return false // Filemoon uses hls2 path
-            // If we know the embed ID, verify it appears in the URL path
-            if (embedId && url.indexOf(embedId) < 0) return false
+            // Relaxed: Filemoon typically uses hls2 path, but don't hard-require it
+            // in case CDN structure changes. Embed ID check is also relaxed -
+            // the ID may appear with suffixes (e.g., m13jtzk62ecl_x).
+            if (embedId) {
+                // Check if embedId appears as a path segment prefix
+                const idRegex = new RegExp(`[/_-]${embedId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}([_-]|$)`)
+                if (!idRegex.test(url)) {
+                    // As fallback, just check if the raw ID appears anywhere
+                    if (url.indexOf(embedId) < 0) return false
+                }
+            }
             return true
         }
 
