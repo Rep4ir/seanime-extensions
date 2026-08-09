@@ -710,15 +710,20 @@ class Provider {
     // Filemoon extraction (the only hoster this build supports)
     // ===========================================================================
     //
-    // The AnimeJara multiplayer embed page (`<div id="lista-server">
-    // <ul id='logo-list'> <li onclick="playVideo("URL")">`) holds one
-    // <li> per mirror hoster. We pick Filemoon only, decode the URL out of
-    // the onclick attribute, then fetch that Filemoon page and pull the
-    // master.m3u8 (preferring master over the per-quality index-v1-a1.m3u8).
+    // The iframe chain is:
+    // 1. Episode page → iframe to multiplayer.streamhj.top/player/multiplayer/embed.php?...
+    //    (the "HenaoJara Player" wrapper)
+    // 2. That wrapper page contains an iframe to the Filemoon embed
+    //    (e.g., https://bysekoze.com/e/<id> or similar CDN-fronted domain)
+    // 3. The Filemoon embed page loads the actual stream via XHR. The tokenized
+    //    master.m3u8 URL is often embedded in the page HTML in obfuscated form
+    //    (in script tags, data attributes, or JavaScript variables) even though
+    //    the browser fetches it dynamically. We extract it server-side by
+    //    fetching the Filemoon page and scanning for the m3u8 URL pattern.
 
     /**
-     * Fetch the AnimeJara multiplayer embed page and return the Filemoon
-     * mirror URL it advertises (or null if Filemoon is not on the list).
+     * Fetch the AnimeJara multiplayer embed page (streamhj.top) and return the
+     * Filemoon embed iframe URL it contains.
      */
     private async _extractFilemoonEmbedUrl(
         embedUrl: string,
@@ -727,70 +732,50 @@ class Provider {
         const html = await this._getHtmlRetry(embedUrl, referer, true)
         if (!html) return null
 
-        // Decode entities once so the onclick regex only sees ASCII quotes.
+        // Decode entities once so regexes see plain ASCII quotes.
         const decoded = this._decodeEntities(html)
 
-        // Primary path: LoadDoc over the <ul id='logo-list'> list. Each <li>
-        // carries the Filemoon URL inside an onclick="playVideo("U")".
-        // We match by <img alt> / <span class="nombre-server">.text() — both
-        // commonly used to label the hoster as "filemoon" (case-insensitive).
+        // The multiplayer page (streamhj.top) contains an iframe pointing to
+        // the Filemoon embed. Look for it first via LoadDoc.
         try {
             const $ = LoadDoc(decoded)
             let found: string | null = null
-            $("ul#logo-list li").each((_, li) => {
+
+            // Strategy 1: Find iframe with Filemoon-like src
+            $("iframe[src]").each((_, el) => {
                 if (found) return
-                const onclick = li.attr("onclick") || ""
-                const m = onclick.match(/playVideo\(\s*"\s*([\s\S]*?)\s*"\s*\)/)
-                if (!m || !m[1]) return
-                let url = this._decodeEntities(m[1]).trim()
-                if (!url || !/^https?:\/\//i.test(url)) return
-
-                // Identify Filemoon by label first, fall back to the URL host.
-                let name = ""
-                li.find("img").each((_i, img) => {
-                    const a = (img.attr("alt") || "").trim().toLowerCase()
-                    if (a) { name = a; return }
-                })
-                if (!name) {
-                    li.find("span.nombre-server").each((_i, sp) => {
-                        const t = (sp.text() || "").trim().toLowerCase()
-                        if (t) { name = t; return }
-                    })
+                const src = $(el).attr("src") || ""
+                if (!src) return
+                // Filemoon embed URLs typically have "/e/<id>" path
+                if (src.indexOf("/e/") >= 0) {
+                    // Additional heuristic: known Filemoon CDN domains or patterns
+                    const host = (() => { try { return new URL(src).hostname.toLowerCase() } catch { return "" } })()
+                    const isFilemoon = host.indexOf("filemoon") >= 0
+                        || host.indexOf("bysekoze") >= 0
+                        || host.indexOf("kiwi") >= 0
+                        || host.indexOf("kkj") >= 0
+                        || host.indexOf("ed33360e") >= 0
+                        || host.indexOf(".sbs") > 0
+                        || host.indexOf(".sx") > 0
+                        || /^https?:\/\/[^/]+\/e\/[A-Za-z0-9_-]{8,}/i.test(src)
+                    if (isFilemoon) found = src
                 }
-                if (!name) {
-                    try { name = new URL(url).hostname.toLowerCase() } catch { name = "" }
-                }
-
-                // Filemoon's CDN-fronted domains change often (e.g.
-                // bysekoze.com, filemoon-ed33360e.kkjqbcgmvcdlo.com, ...).
-                // Match by label OR by the "/e/<id>" path the embeds share
-                // OR by the host containing "filemoon" — never by host alone.
-                const isFilemoon = name.indexOf("filemoon") >= 0
-                    || /^https?:\/\/[^/]+\/e\/[A-Za-z0-9_-]+/i.test(url)
-                        && (url.indexOf("filemoon") >= 0
-                            || url.indexOf("kiwi") >= 0
-                            || url.indexOf("kkj") >= 0
-                            || url.indexOf("bysekoze") >= 0
-                            || url.indexOf("ed33360e") >= 0
-                            || url.indexOf(".sbs") > 0
-                            || url.indexOf(".sx") > 0)
-
-                if (isFilemoon) found = url
             })
             if (found) return found
+
+            // Strategy 2: Regex fallback for iframe src in HTML
+            const iframeRe = /<iframe[^>]+src=(["'])(https?:\/\/[^"']+\/e\/[A-Za-z0-9_-]{8,}[^"']*)\1/i
+            const m = decoded.match(iframeRe)
+            if (m && m[2]) return this._safeUrl(m[2])
         } catch { /* fall through to regex */ }
 
-        // Regex fallback: decode " entities first; then sweep for
-        // any Filemoon-ish URL inside a playVideo("...") call.
-        const re = /playVideo\(\s*"\s*(https?:\/\/[^"]+)\s*"\s*\)/g
+        // Regex fallback: find any Filemoon-ish URL in the page
+        const re = /(https?:\/\/[^\s"'<>]+\/e\/[A-Za-z0-9_-]{8,})/g
         let m: RegExpExecArray | null
         while ((m = re.exec(decoded)) !== null) {
             const url = m[1].trim()
             if (!/^https?:\/\//i.test(url)) continue
-            if (url.indexOf("/e/") < 0) continue
-            // Heuristics: Filemoon embed hosts commonly match one of these
-            // patterns. We accept anything with "/e/<id>" since the hoster
-            // rotates CDN-fronted domains aggressively.
+            // Heuristics for Filemoon CDN domains
             if (
                 url.indexOf("filemoon") >= 0 ||
                 url.indexOf("bysekoze") >= 0 ||
@@ -799,7 +784,7 @@ class Provider {
                 url.indexOf("ed33360e") >= 0 ||
                 /^https?:\/\/[^/]+\/e\/[A-Za-z0-9_-]{8,}/i.test(url)
             ) {
-                return url
+                return this._safeUrl(url)
             }
         }
         return null
@@ -807,8 +792,14 @@ class Provider {
 
     /**
      * Fetch the Filemoon embed page and return the master .m3u8 stream URL.
-     * Falls back to the single-quality index-v1-a1.m3u8 if no master exists.
-     * Returns null if no HLS playlist could be located.
+     * The Filemoon page loads the stream via XHR with dynamic tokens, but the
+     * tokenized URL is often present in the page HTML in obfuscated form:
+     * - In <video>/<source> tags
+     * - In JavaScript variables (playerConfig, source, src, file, etc.)
+     * - In data-src / data-source attributes
+     * - In JSON-LD or similar structures
+     * We fetch the page, normalize escape sequences, and scan comprehensively.
+     * Prefers master.m3u8 (adaptive) over index-v1-a1.m3u8 (single quality).
      */
     private async _resolveFilemoonStream(
         filemoonUrl: string,
@@ -821,47 +812,54 @@ class Provider {
         // obfuscated payloads so the regex sweep sees plain ASCII.
         const normalised = this._decodeEscapeSequences(decoded)
 
-        // Filemoon embeds the m3u8 URLs as plain https strings. The reverse-
-        // engineered markers are 'hls2' and '.m3u8'; both appear in the
-        // adaptive master.m3u8 URL AND the per-quality index-v1-a1.m3u8 URL.
+        // The Filemoon embed ID (from the URL path /e/<id>) often appears in
+        // the m3u8 path. Capture it for validation.
+        const embedIdMatch = filemoonUrl.match(/\/e\/([A-Za-z0-9_-]+)/)
+        const embedId = embedIdMatch ? embedIdMatch[1] : ""
 
-        // 1) Prefer master.m3u8 (adaptive playlist).
-        const masterRe = /(https?:\/\/[^\s"'<>\\]+\/hls2\/[^\s"'<>\\]*\/master\.m3u8[^\s"'<>\\]*)/i
-        const masterMatch = normalised.match(masterRe)
-        if (masterMatch && masterMatch[1]) {
-            return this._safeUrl(masterMatch[1])
+        // Helper: test if a candidate URL looks like a valid Filemoon m3u8
+        const isValidM3u8 = (url: string): boolean => {
+            if (!/^https?:\/\//i.test(url)) return false
+            if (!/\.m3u8(\?.*)?$/i.test(url)) return false
+            if (url.indexOf("hls2") < 0) return false // Filemoon uses hls2 path
+            // If we know the embed ID, verify it appears in the URL path
+            if (embedId && url.indexOf(embedId) < 0) return false
+            return true
         }
 
-        // 2) Loose master sweep — covers variants whose path differs slightly
-        // (master.m3u8 with query-string-first, "?…master.m3u8…", etc.).
-        const anyMaster = normalised.match(/(https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*[?&][^\s"'<>\\]*master[^\s"'<>\\]*)/i)
-        if (anyMaster && anyMaster[1]) {
-            return this._safeUrl(anyMaster[1])
-        }
-        const anyMaster2 = normalised.match(/(https?:\/\/[^\s"'<>\\]+master\.m3u8[^\s"'<>\\]*)/i)
-        if (anyMaster2 && anyMaster2[1]) {
-            return this._safeUrl(anyMaster2[1])
-        }
+        // Ordered list of regex patterns from most specific to most general.
+        // All capture the full URL (with query string) in group 1.
+        const patterns: RegExp[] = [
+            // 1) Master playlist with hls2 path (adaptive, preferred)
+            /(https?:\/\/[^\s"'<>\\]+\/hls2\/[^\s"'<>\\]*\/master\.m3u8[^\s"'<>\\]*)/i,
+            // 2) Master playlist variants (query-string-first, etc.)
+            /(https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*[?&][^\s"'<>\\]*master[^\s"'<>\\]*)/i,
+            /(https?:\/\/[^\s"'<>\\]+master\.m3u8[^\s"'<>\\]*)/i,
+            // 3) Single-quality index-v1-a1.m3u8 (hls2 path)
+            /(https?:\/\/[^\s"'<>\\]+\/hls2\/[^\s"'<>\\]+\/index-v\d+-a\d+\.m3u8[^\s"'<>\\]*)/i,
+            // 4) Any hls2 + .m3u8 URL
+            /(https?:\/\/[^\s"'<>\\]+hls2[^\s"'<>\\]*\.m3u8[^\s"'<>\\]*)/i,
+            // 5) Video/source tag src attributes
+            /<video[^>]+src=(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            /<source[^>]+src=(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            // 6) Common JS variable patterns in script tags
+            /(?:source|src|file|videoUrl|m3u8Url|playlistUrl)\s*[:=]\s*(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            /(?:masterPlaylist|adaptivePlaylist)\s*[:=]\s*(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            // 7) data-src / data-source attributes
+            /data-(?:src|source|m3u8)=(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            // 8) JSON structures with file/source keys
+            /["']file["']\s*:\s*(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            /["']source["']\s*:\s*(["'])(https?:\/\/[^"']+\.m3u8[^"']*)\1/i,
+            // 9) Absolute last resort: any .m3u8 URL
+            /(https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)/i,
+        ]
 
-        // 3) Fall back to the single-quality index-v1-a1.m3u8 (hls2 path).
-        const indexRe = /(https?:\/\/[^\s"'<>\\]+\/hls2\/[^\s"'<>\\]+\/index-v\d+-a\d+\.m3u8[^\s"'<>\\]*)/i
-        const indexMatch = normalised.match(indexRe)
-        if (indexMatch && indexMatch[1]) {
-            return this._safeUrl(indexMatch[1])
-        }
-
-        // 4) Last-ditch: any URL with .m3u8 that also contains 'hls2'.
-        const hls2Re = /(https?:\/\/[^\s"'<>\\]+hls2[^\s"'<>\\]*\.m3u8[^\s"'<>\\]*)/i
-        const hls2Match = normalised.match(hls2Re)
-        if (hls2Match && hls2Match[1]) {
-            return this._safeUrl(hls2Match[1])
-        }
-
-        // 5) Absolute last resort: any plain .m3u8 URL we can find. This is
-        // rare but keeps us resilient when Filemoon fragments the naming.
-        const anyM3u8 = normalised.match(/(https?:\/\/[^\s"'<>\\]+\.m3u8[^\s"'<>\\]*)/i)
-        if (anyM3u8 && anyM3u8[1]) {
-            return this._safeUrl(anyM3u8[1])
+        for (const pattern of patterns) {
+            const match = normalised.match(pattern)
+            if (match && match[1]) {
+                const url = this._safeUrl(match[1])
+                if (isValidM3u8(url)) return url
+            }
         }
 
         return null
