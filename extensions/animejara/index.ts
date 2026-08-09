@@ -345,7 +345,7 @@ class Provider {
     }
 
     // ---------------------------------------------------------------------------
-    // findEpisodeServer — only Filemoon, grouped by language
+    // findEpisodeServer — Filemoon only, grouped by language
     // ---------------------------------------------------------------------------
 
     async findEpisodeServer(episode: EpisodeDetails, server: string): Promise<EpisodeServer> {
@@ -356,38 +356,198 @@ class Provider {
             ? `${this.baseUrl}/movie/${meta.slug}`
             : `${this.baseUrl}/episode/${meta.slug}-${meta.season}x${meta.episode}/`
 
+        // Fetch with proper headers to bypass the soft-404 gate (the episode page
+        // only renders the player iframe + language buttons when it sees a real
+        // browser UA + Referer + Origin + Cloudflare challenge pass-through).
         const html = await this._getHtml(pageUrl, this.baseUrl + "/")
 
-        // Pair every on-page audio with its AnimeJara multiplayer embed URL.
-        // Both lists share the same order (button index == array index).
-        const audios = this._extractPageAudios(html)
-        const links = this._extractEmbedLinks(html)
-        if (links.length === 0) {
-            throw new Error(`No embed links on "${pageUrl}".`)
+        // ---- Strategy 1: Server-rendered player block (real episode page).
+        // Look for the canonical player wrapper + iframe + language buttons.
+        const pairs = this._extractIframeUrlsByLanguage(html)
+        if (pairs.length > 0) {
+            return this._resolveSourcesFromPairs(pairs, meta, pageUrl, server)
         }
 
-        // Filter to the languages of the active mode (sub → JAPONES only;
-        // dub → every non-JAPONES, i.e. latino + castellano + español …).
+        // ---- Strategy 2: Fallback — episode page might have a different
+        // template (e.g. movie page uses slightly different classes). Try
+        // broad iframe + boton-idioma sweep.
+        const fallbackPairs = this._extractIframeUrlsByLanguageBroad(html)
+        if (fallbackPairs.length > 0) {
+            return this._resolveSourcesFromPairs(fallbackPairs, meta, pageUrl, server)
+        }
+
+        // If both strategies fail, we hit the soft-404 gate. Throw a clear
+        // error so the user sees "no servers" instead of an infinite spinner.
+        throw new Error(
+            `Could not locate player iframe on "${pageUrl}". ` +
+            `The site may be blocking the request (Cloudflare / geo gate). ` +
+            `Try opening the page in a browser first to establish a session.`
+        )
+    }
+
+    /**
+     * Parse the server-rendered player block:
+     *   <div id="reproductor-wrapper"> <iframe id="iframe-video" src="..."> ...
+     *   <div class="botones-idioma"> <button class="boton-idioma" data-idioma="LATINO">...
+     * Returns (audioLabel, iframeUrl) pairs. Prefers `data-idioma` on the
+     * iframe if present; otherwise pairs by index order (button[0] ↔ iframe[0]).
+     */
+    private _extractIframeUrlsByLanguage(html: string): Array<{ audio: string; embedUrl: string }> {
         const pairs: Array<{ audio: string; embedUrl: string }> = []
-        if (audios.length === links.length) {
-            for (let i = 0; i < links.length; i++) {
-                const audio = (audios[i] || "").toUpperCase()
-                const isDub = this._isDubAudio(audio)
-                if (meta.wantsDub === isDub) {
-                    pairs.push({ audio, embedUrl: this._decodeEntities(links[i]) })
+        try {
+            const $ = LoadDoc(html)
+            // Find the player wrapper
+            const wrapper = $("#reproductor-wrapper")
+            if (!wrapper.length) return pairs
+
+            // Extract iframe URLs from the wrapper (could be one per language
+            // or a single iframe with language-switch data-attrs)
+            const iframes: Array<{ url: string; langAttr: string | null }> = []
+            wrapper.find("iframe#iframe-video").each((_, el) => {
+                const src = $(el).attr("src") || ""
+                if (!src) return
+                // Some templates put data-idioma / data-lang / data-audio on
+                // the iframe itself — that’s the cleanest pairing.
+                const langAttr =
+                    $(el).attr("data-idioma") ||
+                    $(el).attr("data-lang") ||
+                    $(el).attr("data-audio") ||
+                    null
+                iframes.push({ url: src.trim(), langAttr: langAttr ? langAttr.toUpperCase() : null })
+            })
+
+            // Extract language buttons
+            const buttons: Array<{ lang: string }> = []
+            $(".botones-idioma .boton-idioma, .boton-idioma").each((_, el) => {
+                const lang =
+                    $(el).attr("data-idioma") ||
+                    $(el).attr("data-lang") ||
+                    $(el).attr("data-audio") ||
+                    $(el).find(".lang-name").text() ||
+                    $(el).text()
+                const t = (lang || "").trim().toUpperCase()
+                if (t) buttons.push({ lang: t })
+            })
+
+            // Pairing logic
+            if (iframes.length === 0) return pairs
+
+            if (iframes.length === buttons.length && buttons.length > 0) {
+                // 1:1 pairing by order (button[0] ↔ iframe[0])
+                for (let i = 0; i < iframes.length; i++) {
+                    pairs.push({ audio: buttons[i].lang, embedUrl: iframes[i].url })
+                }
+            } else if (iframes.length === 1 && buttons.length > 0) {
+                // Single iframe + multiple languages — the iframe src is a
+                // multiplayer embed that itself contains the language list.
+                // We'll pass each language with the same embed URL; the
+                // multiplayer embed will serve the right language.
+                for (const btn of buttons) {
+                    pairs.push({ audio: btn.lang, embedUrl: iframes[0].url })
+                }
+            } else if (iframes.length > 0) {
+                // Multiple iframes, no buttons (or button count mismatch).
+                // Use iframe's own data-idioma if available; else fall back
+                // to JAPONES for the first, then LATINO/CASTELLANO for rest.
+                const langOrder = [Provider.LANG_JAPONESES, "LATINO", "CASTELLANO", "ESPAÑOL"]
+                for (let i = 0; i < iframes.length; i++) {
+                    const lang = iframes[i].langAttr || langOrder[i] || Provider.LANG_JAPONESES
+                    pairs.push({ audio: lang, embedUrl: iframes[i].url })
                 }
             }
-        } else if (links.length > 0) {
-            // Audio buttons not parseable — fall back to the first embed and
-            // label it with the mode (so we still surface something instead
-            // of "no servers available").
-            const fallbackAudio = meta.wantsDub ? "LATINO" : Provider.LANG_JAPONESES
-            pairs.push({ audio: fallbackAudio, embedUrl: this._decodeEntities(links[0]) })
-        }
+        } catch { /* fall through to broad */ }
+        return pairs
+    }
+
+    /**
+     * Broad fallback: find any iframe whose src looks like an animejara
+     * multiplayer embed (streamhj.top/embed.php), and any element that
+     * looks like a language selector (boton-idioma, botones-idioma,
+     * lang-name, lang-code). Pair by index or use iframe data-attrs.
+     */
+    private _extractIframeUrlsByLanguageBroad(html: string): Array<{ audio: string; embedUrl: string }> {
+        const pairs: Array<{ audio: string; embedUrl: string }> = []
+        try {
+            const $ = LoadDoc(html)
+            // Collect candidate embed iframes (streamhj / multiplayer / embed.php)
+            const embedIframes: Array<{ url: string; langAttr: string | null }> = []
+            $("iframe[src]").each((_, el) => {
+                const src = $(el).attr("src") || ""
+                if (!src) return
+                // AnimeJara embed URLs contain these markers
+                if (src.indexOf("streamhj.top") < 0 && src.indexOf("embed.php") < 0 && src.indexOf("multiplayer") < 0) return
+                const langAttr =
+                    $(el).attr("data-idioma") ||
+                    $(el).attr("data-lang") ||
+                    $(el).attr("data-audio") ||
+                    null
+                embedIframes.push({ url: src.trim(), langAttr: langAttr ? langAttr.toUpperCase() : null })
+            })
+            if (embedIframes.length === 0) return pairs
+
+            // Collect language selectors (broad match)
+            const langSelectors = [
+                ".botones-idioma .boton-idioma",
+                ".boton-idioma",
+                "[data-idioma]",
+                "[data-lang]",
+                "[data-audio]",
+                ".lang-name",
+                ".lang-code",
+            ]
+            const buttons: Array<{ lang: string }> = []
+            for (const sel of langSelectors) {
+                $(sel).each((_, el) => {
+                    const lang =
+                        $(el).attr("data-idioma") ||
+                        $(el).attr("data-lang") ||
+                        $(el).attr("data-audio") ||
+                        $(el).find(".lang-name").text() ||
+                        $(el).text()
+                    const t = (lang || "").trim().toUpperCase()
+                    if (t) buttons.push({ lang: t })
+                })
+                if (buttons.length > 0) break // first selector that yields results wins
+            }
+
+            // Pair by order if counts match; else use iframe data-attrs
+            if (embedIframes.length === buttons.length && buttons.length > 0) {
+                for (let i = 0; i < embedIframes.length; i++) {
+                    pairs.push({ audio: buttons[i].lang, embedUrl: embedIframes[i].url })
+                }
+            } else if (embedIframes.length === 1 && buttons.length > 0) {
+                for (const btn of buttons) pairs.push({ audio: btn.lang, embedUrl: embedIframes[0].url })
+            } else {
+                const langOrder = [Provider.LANG_JAPONESES, "LATINO", "CASTELLANO", "ESPAÑOL"]
+                for (let i = 0; i < embedIframes.length; i++) {
+                    const lang = embedIframes[i].langAttr || langOrder[i] || Provider.LANG_JAPONESES
+                    pairs.push({ audio: lang, embedUrl: embedIframes[i].url })
+                }
+            }
+        } catch { /* give up */ }
+        return pairs
+    }
+
+    /**
+     * Given a list of (audioLabel, multiplayerEmbedUrl) pairs, resolve each
+     * to a real Filemoon .m3u8 URL and build the EpisodeServer response.
+     * Filters to the active mode (sub ⇒ JAPONES; dub ⇒ everything else).
+     */
+    private async _resolveSourcesFromPairs(
+        allPairs: Array<{ audio: string; embedUrl: string }>,
+        meta: { slug: string; season: number; episode: number; wantsDub: boolean },
+        pageUrl: string,
+        server: string
+    ): Promise<EpisodeServer> {
+        // Keep only languages matching the active mode
+        const pairs = allPairs.filter((p) => {
+            const isDub = this._isDubAudio(p.audio)
+            return meta.wantsDub === isDub
+        })
 
         if (pairs.length === 0) {
             throw new Error(
-                `No ${meta.wantsDub ? "dub" : "sub"} source for "${meta.slug}" ` +
+                `No ${meta.wantsDub ? "dub" : "sub"} language found on the page for "${meta.slug}" ` +
                 `S${meta.season}E${meta.episode}.`
             )
         }
@@ -396,20 +556,16 @@ class Provider {
         for (const pair of pairs) {
             const langLabel = this._audioLabel(pair.audio)
 
-            // The multiplayer embed page hosts the Filemoon <li> server entry.
+            // The multiplayer embed page hosts the Filemoon mirror <li>.
             const filemoonEmbedUrl = await this._extractFilemoonEmbedUrl(pair.embedUrl, pageUrl)
-            if (!filemoonEmbedUrl) continue // skip this language, keep going
+            if (!filemoonEmbedUrl) continue // skip this language
 
-            // Resolve the real .m3u8 stream URL from the Filemoon page.
             const stream = await this._resolveFilemoonStream(filemoonEmbedUrl, pair.embedUrl)
             if (!stream) continue
 
             videoSources.push({
                 url: stream,
                 type: "m3u8" as VideoSourceType,
-                // quality must be unique across videoSources; the (hoster,
-                // language) pair guarantees that even if the same hoster
-                // appears under two dubs.
                 quality: `Filemoon - ${langLabel}`,
                 label: langLabel,
                 subtitles: [],
@@ -423,9 +579,6 @@ class Provider {
             )
         }
 
-        // Honour the requested server if it matches one of our qualities;
-        // otherwise default to the first resolved source. Seanime switches
-        // between videoSources using their `quality` string.
         let chosenServer = server
         if (!videoSources.some((v) => v.quality === server)) {
             chosenServer = videoSources[0].quality
@@ -551,34 +704,6 @@ class Provider {
             }
         }
         return audios
-    }
-
-    /**
-     * Extract the per-language embed-URL JS array from an episode page
-     * (`enlaces = [...]`) or movie page (`movieLinks = [...]`).
-     */
-    private _extractEmbedLinks(html: string): string[] {
-        const out: string[] = []
-        const re = /(?:enlaces|movieLinks)\s*=\s*(\[[\s\S]*?\])\s*;/
-        const m = re.exec(html)
-        if (!m) {
-            // Last-ditch sweep for streamhj embed URLs anywhere on the page.
-            const fre = /https?:\/\/[^\s"'<>]+embed\.php\?idanime=\d+&idcapitulo=\d+/g
-            let fm: RegExpExecArray | null
-            while ((fm = fre.exec(html)) !== null) out.push(fm[0])
-            return out
-        }
-        try {
-            const arr = JSON.parse(m[1])
-            if (Array.isArray(arr)) {
-                for (const u of arr) if (typeof u === "string") out.push(u)
-            }
-        } catch {
-            const qre = /"([^"]+)"/g
-            let qm: RegExpExecArray | null
-            while ((qm = qre.exec(m[1])) !== null) out.push(qm[1])
-        }
-        return out
     }
 
     // ===========================================================================
