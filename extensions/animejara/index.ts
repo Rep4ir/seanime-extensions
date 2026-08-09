@@ -113,12 +113,18 @@ class Provider {
     private _baseHeaders(referer?: string): Record<string, string> {
         const h: Record<string, string> = {
             "User-Agent": Provider.UA,
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9,es;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
             "Sec-Fetch-Dest": "document",
             "Sec-Fetch-Mode": "navigate",
             "Sec-Fetch-Site": "same-origin",
+            "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
+            "Sec-CH-UA": '"Google Chrome";v="125", "Chromium";v="125", "Not.A/Brand";v="24"',
+            "Sec-CH-UA-Mobile": "?0",
+            "Sec-CH-UA-Platform": '"Windows"',
+            "Cache-Control": "max-age=0",
         }
         if (referer) h["Referer"] = referer
         return h
@@ -402,7 +408,16 @@ class Provider {
         } catch (e: any) {
             const msg = String(e?.message || e)
             if (msg.indexOf("Soft-404 gate") >= 0) {
-                html = await this._getHtmlWithChromeDP(pageUrl)
+                try {
+                    html = await this._getHtmlWithChromeDP(pageUrl)
+                } catch (chromeErr: any) {
+                    throw new Error(
+                        `Soft-404 gate hit AND ChromeDP fallback failed: ${chromeErr?.message || chromeErr}. ` +
+                        `The episode page requires a real browser session. ` +
+                        `Open https://animejara.com/episode/${meta.slug}-${meta.season}x${meta.episode}/ ` +
+                        `in a browser first, then retry.`
+                    )
+                }
             } else {
                 throw e
             }
@@ -440,6 +455,10 @@ class Provider {
     private async _getHtmlWithChromeDP(url: string): Promise<string> {
         let browser: any = null
         try {
+            // Check if ChromeDP is available
+            if (typeof ChromeDP === "undefined" || typeof ChromeDP.newBrowser !== "function") {
+                throw new Error("ChromeDP API not available in this Seanime runtime")
+            }
             browser = await ChromeDP.newBrowser({ headless: true, timeout: 60 })
             await browser.navigate(url)
             // Wait for the player wrapper to appear (it's rendered server-side,
@@ -451,7 +470,7 @@ class Provider {
         } catch (e: any) {
             throw new Error(
                 `ChromeDP failed to load episode page "${url}": ${e?.message || e}. ` +
-                `Ensure Chrome/Chromium is installed on the Seanime host.`
+                `Ensure Chrome/Chromium is installed on the Seanime host and ChromeDP is enabled.`
             )
         } finally {
             if (browser) {
