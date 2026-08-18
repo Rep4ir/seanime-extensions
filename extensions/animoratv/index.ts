@@ -26,7 +26,7 @@ class Provider {
 
     getSettings(): Settings {
         return {
-            episodeServers: ["default"],
+            episodeServers: ["HLS", "MP4"],
             supportsDub: false,
         }
     }
@@ -221,7 +221,7 @@ class Provider {
     // findEpisodeServer
     // ---------------------------------------------------------------------------
 
-    async findEpisodeServer(episode: EpisodeDetails, _server: string): Promise<EpisodeServer> {
+    async findEpisodeServer(episode: EpisodeDetails, server: string): Promise<EpisodeServer> {
         const parts = episode.id.split("::")
         if (parts.length !== 2) {
             throw new Error(`Invalid episode id format: "${episode.id}"`)
@@ -254,7 +254,8 @@ class Provider {
                 throw new Error("No video sources found")
             }
 
-            const videoSources: VideoSource[] = []
+            const hlsSources: VideoSource[] = []
+            const mp4Sources: VideoSource[] = []
 
             for (const fuente of data.fuentes) {
                 for (const servidor of fuente.servidores) {
@@ -269,14 +270,39 @@ class Provider {
                         continue
                     }
 
-                    videoSources.push({
+                    const source: VideoSource = {
                         url: streamUrl,
                         type: isM3u8 ? "m3u8" : "mp4",
                         quality,
                         label: servidor.proveedor,
                         subtitles: [],
-                    })
+                    }
+
+                    if (isM3u8) {
+                        hlsSources.push(source)
+                    } else {
+                        mp4Sources.push(source)
+                    }
                 }
+            }
+
+            // Determine which server to use based on available sources and requested server
+            let selectedServer = "HLS"
+            let videoSources = hlsSources
+
+            if (server === "MP4" && mp4Sources.length > 0) {
+                selectedServer = "MP4"
+                videoSources = mp4Sources
+            } else if (server === "HLS" && hlsSources.length > 0) {
+                selectedServer = "HLS"
+                videoSources = hlsSources
+            } else if (hlsSources.length > 0) {
+                // Default to HLS if available
+                selectedServer = "HLS"
+                videoSources = hlsSources
+            } else if (mp4Sources.length > 0) {
+                selectedServer = "MP4"
+                videoSources = mp4Sources
             }
 
             if (videoSources.length === 0) {
@@ -284,7 +310,7 @@ class Provider {
             }
 
             return {
-                server: _server || "default",
+                server: selectedServer,
                 headers: {
                     "Referer": `${this.baseUrl}/anime/${slug}/episodio/${epNum}/`,
                     "Origin": this.baseUrl,
