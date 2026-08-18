@@ -1,0 +1,12 @@
+{
+    "id": "animoratv-provider",
+    "name": "AnimoraTV",
+    "description": "Stream anime from animoratv.com (Spanish subtitles)",
+    "manifestURI": "https://raw.githubusercontent.com/Rep4ir/anime/refs/heads/main/extensions/animoratv/manifest.json",
+    "version": "1.0.0",
+    "author": "Rep4ir",
+    "type": "onlinestream-provider",
+    "language": "typescript",
+    "lang": "es",
+    "payloadURI": "https://raw.githubusercontent.com/Rep4ir/anime/refs/heads/main/extensions/animoratv/index.ts"
+}
